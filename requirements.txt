@@ -1,0 +1,8 @@
+pandas
+numpy
+yfinance
+feedparser
+requests
+
+# Optional Interactive Brokers TWS/Gateway connector (install only when needed)
+ib_insync

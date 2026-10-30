@@ -1,0 +1,16 @@
+Strategy backtest (cost 0.05R per trade, next-candle entry, one trade at a time)
+
+Position         {'trades': 12, 'win%': 50.0, 'PF': 1.99, 'avgR': 0.451, 'totalR': 5.4, 'maxDD_R': 2.3}
+Intraday ORB     {'trades': 167, 'win%': 43.1, 'PF': 1.21, 'avgR': 0.125, 'totalR': 20.9, 'maxDD_R': 9.9}
+Day trading      {'trades': 281, 'win%': 38.8, 'PF': 1.18, 'avgR': 0.112, 'totalR': 31.5, 'maxDD_R': 26.8}
+Reversal         {'trades': 148, 'win%': 40.5, 'PF': 1.14, 'avgR': 0.087, 'totalR': 12.9, 'maxDD_R': 19.0}
+Range            {'trades': 98, 'win%': 31.6, 'PF': 1.05, 'avgR': 0.032, 'totalR': 3.2, 'maxDD_R': 10.4}
+Swing            {'trades': 557, 'win%': 33.8, 'PF': 0.95, 'avgR': -0.037, 'totalR': -20.9, 'maxDD_R': 40.8}
+Quant factor     {'trades': 471, 'win%': 33.1, 'PF': 0.92, 'avgR': -0.056, 'totalR': -26.5, 'maxDD_R': 49.0}
+Price action     {'trades': 690, 'win%': 32.0, 'PF': 0.88, 'avgR': -0.089, 'totalR': -61.5, 'maxDD_R': 70.8}
+Scalping         {'trades': 147, 'win%': 38.1, 'PF': 0.85, 'avgR': -0.098, 'totalR': -14.4, 'maxDD_R': 21.9}
+Trend            {'trades': 197, 'win%': 25.4, 'PF': 0.79, 'avgR': -0.162, 'totalR': -31.9, 'maxDD_R': 40.3}
+Breakout         {'trades': 279, 'win%': 24.0, 'PF': 0.73, 'avgR': -0.212, 'totalR': -59.3, 'maxDD_R': 66.5}
+Mean reversion   {'trades': 20, 'win%': 25.0, 'PF': 0.52, 'avgR': -0.382, 'totalR': -7.6, 'maxDD_R': 8.6}
+
+Buy and hold benchmark over the daily sample: BTC-USD -6%, EURUSD=X +11%
