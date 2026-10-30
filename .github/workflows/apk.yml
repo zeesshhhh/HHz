@@ -43,6 +43,35 @@ jobs:
               s += "\ndependencies {\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.4'\n}\n"
           open(p, 'w').write(s)
           print(s)
+          # Force every plugin module to compile against SDK 36 (file_picker still uses 34)
+          import os
+          kts = 'build_app/android/build.gradle.kts'
+          grv = 'build_app/android/build.gradle'
+          if os.path.exists(kts):
+              patch = (
+                  'subprojects {\n'
+                  '    afterEvaluate {\n'
+                  '        val a = extensions.findByName("android")\n'
+                  '        if (a != null) {\n'
+                  '            val m = a.javaClass.methods.firstOrNull { it.name == "setCompileSdk" && it.parameterCount == 1 }\n'
+                  '                ?: a.javaClass.methods.firstOrNull { it.name == "compileSdkVersion" && it.parameterTypes.size == 1 && it.parameterTypes[0] == Int::class.javaPrimitiveType }\n'
+                  '            if (m != null) { m.isAccessible = true; m.invoke(a, 36); println("compileSdk 36 set for $name") } else { println("compileSdk patch NOT applied for $name") }\n'
+                  '        }\n'
+                  '    }\n'
+                  '}\n\n'
+              )
+              orig = open(kts).read()
+              open(kts, 'w').write(patch + orig)
+          elif os.path.exists(grv):
+              patch = (
+                  'subprojects {\n'
+                  '    afterEvaluate { prj ->\n'
+                  '        if (prj.hasProperty("android")) { prj.android.compileSdkVersion 36 }\n'
+                  '    }\n'
+                  '}\n\n'
+              )
+              orig = open(grv).read()
+              open(grv, 'w').write(patch + orig)
           PY
       - name: Use the same signing key every build so updates keep your saved data
         run: |
@@ -53,11 +82,6 @@ jobs:
         run: |
           flutter pub get
           flutter build apk --release --build-number=${{ github.run_number }} --dart-define=FEED_URL=https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/docs/feed.json
-      - name: Show signing certificate (a correct build ends in 95:89:00)
-        continue-on-error: true
-        run: |
-          AS=$(ls $ANDROID_HOME/build-tools/*/apksigner | tail -1)
-          $AS verify --print-certs build_app/build/app/outputs/flutter-apk/app-release.apk | grep -i "SHA-256"
       - uses: actions/upload-artifact@v4
         with:
           name: signal-bot
