@@ -1,0 +1,70 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    paths: ["app_src/**", ".github/workflows/apk.yml"]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - uses: subosito/flutter-action@v2
+        with: { channel: stable, cache: true }
+      - name: Create Android project and add our app
+        run: |
+          flutter create build_app --platforms=android --project-name signal_bot --org com.signalbot
+          cp app_src/main.dart build_app/lib/main.dart
+          cp app_src/pubspec.yaml build_app/pubspec.yaml
+          rm -rf build_app/test
+          cp app_src/debug.keystore build_app/android/app/debug.keystore
+          M=build_app/android/app/src/main/AndroidManifest.xml
+          sed -i 's#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' $M
+          sed -i 's#android:label="[^"]*"#android:label="Signal Bot"#' $M
+          sed -i 's#<application#<uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>\n    <uses-permission android:name="android.permission.VIBRATE"/>\n    <application#' $M
+          python3 - <<'PY'
+          import glob
+          p = (glob.glob('build_app/android/app/build.gradle.kts') or glob.glob('build_app/android/app/build.gradle'))[0]
+          s = open(p).read()
+          # sign every build with our fixed key so a new APK installs over the old one and keeps the saved data
+          sc_kts = '    signingConfigs {\n        getByName("debug") {\n            storeFile = file("debug.keystore")\n            storePassword = "android"\n            keyAlias = "androiddebugkey"\n            keyPassword = "android"\n        }\n    }\n'
+          sc_groovy = "    signingConfigs {\n        debug {\n            storeFile file('debug.keystore')\n            storePassword 'android'\n            keyAlias 'androiddebugkey'\n            keyPassword 'android'\n        }\n    }\n"
+          assert 'android {\n' in s
+          s = s.replace('android {\n', 'android {\n' + (sc_kts if p.endswith('.kts') else sc_groovy), 1)
+          if p.endswith('.kts'):
+              s = s.replace('compileOptions {', 'compileOptions {\n        isCoreLibraryDesugaringEnabled = true', 1)
+              s += '\ndependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")\n}\n'
+          else:
+              s = s.replace('compileOptions {', 'compileOptions {\n        coreLibraryDesugaringEnabled true', 1)
+              s += "\ndependencies {\n    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.0.4'\n}\n"
+          open(p, 'w').write(s)
+          print(s)
+          PY
+      - name: Use the same signing key every build so updates keep your saved data
+        run: |
+          mkdir -p ~/.android
+          cp app_src/debug.keystore ~/.android/debug.keystore
+      - name: Build release APK
+        working-directory: build_app
+        run: |
+          flutter pub get
+          flutter build apk --release --build-number=${{ github.run_number }} --dart-define=FEED_URL=https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/docs/feed.json
+      - name: Show signing certificate (a correct build ends in 95:89:00)
+        continue-on-error: true
+        run: |
+          AS=$(ls $ANDROID_HOME/build-tools/*/apksigner | tail -1)
+          $AS verify --print-certs build_app/build/app/outputs/flutter-apk/app-release.apk | grep -i "SHA-256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signal-bot
+          path: build_app/build/app/outputs/flutter-apk/app-release.apk
+      - name: Publish APK as a GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp build_app/build/app/outputs/flutter-apk/app-release.apk signal-bot.apk
+          gh release create "apk-${{ github.run_number }}" signal-bot.apk --title "signal-bot APK #${{ github.run_number }}" --notes "Download signal-bot.apk on your phone and install it."

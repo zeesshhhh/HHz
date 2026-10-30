@@ -1,0 +1,95 @@
+name: Signal bot
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # scan (use a public repo, or change to */30 or hourly to save Actions minutes)
+    - cron: "0 6 * * *"      # daily report
+    - cron: "0 7 * * 1"      # weekly investing report
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: scan, report, invest, backtest or lab
+        default: scan
+permissions:
+  contents: write
+concurrency:
+  group: signal-bot
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install -r requirements.txt
+      - uses: actions/cache@v4
+        with:
+          path: |
+            state.json
+            paper.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+      - name: Run
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          COPY_SOURCE_URL: ${{ secrets.COPY_SOURCE_URL }}
+        run: |
+          SCHED="${{ github.event.schedule }}"
+          MODE="${{ github.event.inputs.mode }}"
+          if [ -z "$MODE" ]; then
+            case "$SCHED" in
+              "0 6 * * *") MODE=report ;;
+              "0 7 * * 1") MODE=invest ;;
+              *) MODE=scan ;;
+            esac
+          fi
+          if [ "$MODE" = "lab" ]; then echo "Lab only"; elif [ "$MODE" = "backtest" ]; then python backtest.py; else python main.py "$MODE"; fi
+      - name: Restore Signal Lab state
+        if: always()
+        continue-on-error: true
+        run: |
+          mkdir -p docs
+          git fetch --depth=1 origin lab-data
+          for f in lab_state.json lab_snapshots.csv; do
+            git show "FETCH_HEAD:$f" > "/tmp/$f" && mv "/tmp/$f" "docs/$f"
+          done
+      - name: Signal Lab (indicator accuracy, server side)
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 17
+        env:
+          LAB_MAX_SECONDS: "720"
+        run: python lab.py
+      - name: Publish Signal Lab data (own branch, no history kept)
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ -f docs/lab.json ] || exit 0
+          rm -rf /tmp/labpub && mkdir /tmp/labpub
+          cp docs/lab.json docs/lab_state.json docs/lab_accuracy.csv docs/lab_snapshots.csv /tmp/labpub/
+          cd /tmp/labpub
+          git init -q -b lab-data
+          git config user.name "signal-bot"
+          git config user.email "signal-bot@users.noreply.github.com"
+          git add .
+          git commit -qm "lab data"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git push -f origin lab-data
+      - name: Publish feed for the Android app
+        if: always()
+        run: |
+          git config user.name "signal-bot"
+          git config user.email "signal-bot@users.noreply.github.com"
+          git add docs/feed.json docs/paper.json docs/paper_log.csv || true
+          git diff --cached --quiet || (git commit -m "update feed" && git push)
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results
+          path: backtest_results.txt
+          if-no-files-found: ignore
