@@ -1617,6 +1617,47 @@ Future<bool> writeStore(String name, String text) async {
 // ---------- Signal Lab: scores every indicator and every trading style against what price did next ----------
 const labHorizonBars = 6;       // judged 6 candles after the signal
 const labRaceAtr = 1.5;         // target and stop distance for the race test, in ATR
+const labFee = 0.05;            // same paper fee as everywhere else, in R
+/// The only indicators the Lab records (your choice, Nov 10: 7 first, then RSI (14), Z-score (20) and Ultimate Oscillator). Everything else was removed from the Lab.
+/// The Experiments tab (GitHub) still tests 40 indicators, so they can be compared there.
+const labKeep = ['RSI (2)', 'RSI (14)', 'CCI (20)', 'Stochastic (14,3)', 'Stochastic RSI', 'MFI (14)', 'Bollinger %B (20,2)', 'Z-score (20)',
+  'Ultimate Oscillator', 'Candle pattern'];
+
+/// One Lab signal seen as a trade: entry at the signal candle's close, target and stop 1.5 ATR (1:1), judged over 6 candles.
+class LabTrade {
+  final LabSnap s;
+  final int side;
+  final bool open;
+  LabTrade(this.s, this.side, this.open);
+  String get result => open ? 'OPEN' : s.race == side ? 'WIN' : s.race == -side ? 'LOSS' : 'TIMEOUT';
+  double get r => open ? 0 : s.race == side ? 1 - labFee : s.race == -side ? -1 - labFee
+      : (s.move * side / labRaceAtr).clamp(-1.0, 1.0).toDouble() - labFee;
+  double get tp => s.price + side * labRaceAtr * s.atr;
+  double get sl => s.price - side * labRaceAtr * s.atr;
+}
+
+class LabStat {
+  int n = 0, w = 0, l = 0, t = 0, open = 0;
+  double r = 0;
+  void add(LabTrade x) {
+    if (x.open) { open++; return; }
+    n++;
+    r += x.r;
+    if (x.result == 'WIN') { w++; } else if (x.result == 'LOSS') { l++; } else { t++; }
+  }
+  double? get winPct => w + l == 0 ? null : 100.0 * w / (w + l);
+  String get text => '$n trades: $w won, $l lost, $t timed out${winPct == null ? '' : ', ${winPct!.toStringAsFixed(0)}% of decided'}, '
+      '${r >= 0 ? '+' : ''}${r.toStringAsFixed(1)}R${open > 0 ? ', $open open' : ''}';
+}
+
+String labTradesCsv(List<LabTrade> list) {
+  final lines = ['time_utc,coin,tf,style,side,entry,target,stop,atr,result,r_multiple,move_atr_at_horizon'];
+  for (final x in list) {
+    lines.add([x.s.t0.toUtc().toIso8601String(), x.s.coin, x.s.tf, styleOf(x.s.tf), x.side == 1 ? 'BUY' : 'SELL', x.s.price, x.tp, x.sl, x.s.atr,
+      x.result, x.open ? '' : x.r.toStringAsFixed(3), x.open ? '' : x.s.move.toStringAsFixed(3)].join(','));
+  }
+  return lines.join('\n') + '\n';
+}
 
 String styleOf(String tf) => (tf == '1m' || tf == '5m' || tf == '15m') ? 'Scalping' : (tf == '30m' || tf == '1h') ? 'Intraday' : tf == '4h' ? 'Swing' : 'Position';
 
@@ -1851,7 +1892,9 @@ class _HomeState extends State<Home> {
   Map<String, int> labLogged = {};
   bool labOn = false, labBusy = false, labLoaded = false, lab5m = false;
   int labCoins = 20, labScored = 0;
-  String labStyle = 'All', labCat = 'All', labStatus = '';
+  String labStyle = 'All', labCat = 'All', labStatus = '', labSide = 'All';
+  String? labSel;          // indicator whose trades are shown
+  int labShown = 50;
   DateTime? labUpdated;
   Timer? labTimer, uiTimer;
   final ValueNotifier<int> liveTick = ValueNotifier<int>(0);   // redraws only the live trades table every second when there are many trades
@@ -2009,6 +2052,13 @@ class _HomeState extends State<Home> {
         labPending = (j['pending'] as List).map((e) => LabSnap.fromJson(Map<String, dynamic>.from(e as Map))).toList();
         labRows = (j['rows'] as List).map((e) => LabSnap.fromJson(Map<String, dynamic>.from(e as Map))).toList();
         labLogged = {for (final e in (j['logged'] as Map).entries) '${e.key}': (e.value as num).toInt()};
+        // keep only the Lab indicators (older data had about 50)
+        labAgg.removeWhere((k, _) => !labKeep.contains(k.substring(0, k.lastIndexOf('|'))));
+        for (final sn in [...labPending, ...labRows]) {
+          sn.votes.removeWhere((k, _) => !labKeep.contains(k));
+        }
+        labPending.removeWhere((sn) => sn.votes.isEmpty);
+        labRows.removeWhere((sn) => sn.votes.isEmpty);
       }
       labLoaded = true;
     } catch (_) {
@@ -2022,7 +2072,7 @@ class _HomeState extends State<Home> {
 
   Future<void> saveLab() async {
     if (!labLoaded) return;
-    if (labRows.length > 1500) labRows = labRows.sublist(labRows.length - 1500);
+    if (labRows.length > 6000) labRows = labRows.sublist(labRows.length - 6000);   // 10 indicators per row now, so more rows fit
     if (labPending.length > 4000) labPending = labPending.sublist(labPending.length - 4000);
     await writeStore('lab.json', jsonEncode({
       'on': labOn, 'm5': lab5m, 'coins': labCoins, 'scored': labScored, 'agg': labAgg,
@@ -2103,10 +2153,8 @@ class _HomeState extends State<Home> {
             if (a.atr.isNaN || a.atr <= 0) return null;
             final votes = <String, int>{};
             for (final r in [...a.ma, ...a.osc]) {
-              if (r.sig != 0) votes[r.name] = r.sig;
+              if (r.sig != 0 && labKeep.contains(r.name)) votes[r.name] = r.sig;
             }
-            if (a.side != 0) votes['OVERALL verdict'] = a.side;
-            if (a.score.abs() >= .5) votes['OVERALL strong verdict'] = a.side;
             return LabSnap(j[0], j[1], t0, closed.last.close, a.atr, votes)..move = t0.millisecondsSinceEpoch.toDouble();
           } catch (_) {
             return null;
@@ -2115,12 +2163,13 @@ class _HomeState extends State<Home> {
         for (final sn in res.whereType<LabSnap>()) {
           labLogged['${sn.coin}|${sn.tf}'] = sn.move.toInt();     // temporarily carried the candle time here
           sn.move = 0;
+          if (sn.votes.isEmpty) continue;                          // none of the Lab indicators signalled on this candle
           labPending.add(sn);
           added++;
         }
       }
       labUpdated = DateTime.now();
-      labStatus = 'Last run: logged $added new signal sets, ${labPending.length} waiting to be scored, $labScored scored in total.';
+      labStatus = 'Last run: $added candles with a signal from the ${labKeep.length} Lab indicators, ${labPending.length} waiting to be scored, $labScored scored in total.';
       await saveLab();
     } catch (e) {
       labStatus = 'Lab could not run: $e';
@@ -4876,45 +4925,54 @@ class _HomeState extends State<Home> {
 
   Widget labTab() {
     const styles = ['All', 'Scalping', 'Intraday', 'Swing', 'Position'];
-    const cats = ['All', 'Overall verdict', 'Trend', 'Momentum / oscillators', 'Volume', 'Breakout / volatility', 'Support / resistance', 'Candle patterns'];
-    const minN = 30;
-    // rows for the chosen style
-    final entries = <MapEntry<String, List<double>>>[];
-    labAgg.forEach((k, a) {
-      final i = k.lastIndexOf('|');
-      if (k.substring(i + 1) != labStyle) return;
-      final name = k.substring(0, i);
-      if (labCat != 'All' && categoryOf(name) != labCat) return;
-      entries.add(MapEntry(name, a));
-    });
-    double? raceWin(List<double> a) => a[2] + a[3] > 0 ? a[2] / (a[2] + a[3]) : null;
-    double score(MapEntry<String, List<double>> e) => e.value[0] < minN ? -9 : (raceWin(e.value) ?? .5);
-    entries.sort((a, b) => score(b).compareTo(score(a)));
-    // category summary (all indicators in a category pooled)
-    final catSum = <String, List<double>>{};
-    labAgg.forEach((k, a) {
-      final i = k.lastIndexOf('|');
-      if (k.substring(i + 1) != labStyle) return;
-      final c = categoryOf(k.substring(0, i));
-      final t = catSum.putIfAbsent(c, () => [0, 0, 0, 0, 0]);
-      for (var x = 0; x < 5; x++) {
-        t[x] += a[x];
+    bool inStyle(LabSnap x) => labStyle == 'All' || styleOf(x.tf) == labStyle;
+    bool inSide(int side) => labSide == 'All' || (labSide == 'BUY') == (side == 1);
+    // one stats row per Lab indicator, from the scored and the still-open signals
+    final stats = {for (final n in labKeep) n: LabStat()};
+    for (final x in labRows) {
+      if (!inStyle(x)) continue;
+      x.votes.forEach((n, sd) { if (inSide(sd)) stats[n]?.add(LabTrade(x, sd, false)); });
+    }
+    for (final x in labPending) {
+      if (!inStyle(x)) continue;
+      x.votes.forEach((n, sd) { if (inSide(sd)) stats[n]?.add(LabTrade(x, sd, true)); });
+    }
+    final order = [...labKeep]..sort((p, q) => stats[q]!.r.compareTo(stats[p]!.r));
+    Color rc(double v) => v >= 0 ? Colors.green : Colors.red;
+    String sg(double v) => '${v >= 0 ? '+' : ''}${v.toStringAsFixed(2)}';
+    String when(DateTime t) => '${t.day.toString().padLeft(2, '0')}/${t.month.toString().padLeft(2, '0')} ${hhmm(t)}';
+    // trades of the selected indicator, newest first (open ones on top)
+    final sel = labSel;
+    final list = <LabTrade>[];
+    if (sel != null) {
+      for (final x in labPending.reversed) {
+        final sd = x.votes[sel];
+        if (sd != null && inStyle(x) && inSide(sd)) list.add(LabTrade(x, sd, true));
       }
-    });
-    // style summary of the overall verdict
-    final styleSum = <String, List<double>?>{for (final st in styles.skip(1)) st: labAgg['OVERALL verdict|$st']};
-    Color wc(double? w, double n) => n < minN || w == null ? Colors.grey : w >= .55 ? Colors.green : w <= .45 ? Colors.red : Colors.orange;
-    String pct(double? w) => w == null ? '-' : '${(w * 100).toStringAsFixed(0)}%';
+      for (final x in labRows.reversed) {
+        final sd = x.votes[sel];
+        if (sd != null && inStyle(x) && inSide(sd)) list.add(LabTrade(x, sd, false));
+      }
+    }
+    Map<String, LabStat> splitBy(String Function(LabTrade) f) {
+      final m = <String, LabStat>{};
+      for (final x in list) {
+        m.putIfAbsent(f(x), () => LabStat()).add(x);
+      }
+      return m;
+    }
     return ListView(physics: const AlwaysScrollableScrollPhysics(), padding: const EdgeInsets.all(12), children: [
       Card(
         child: Padding(
           padding: const EdgeInsets.all(14),
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Row(children: [
-              const Expanded(child: Text('Signal Lab', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16))),
+              Expanded(child: Text('Signal Lab (${labKeep.length} indicators)', style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16))),
               Switch(value: labOn, onChanged: setLabOn),
             ]),
-            const Text('Records what every indicator said on the top coins at each candle close (15m, 1h, 4h, 1d), then checks what price did over the next 6 candles. Race test: did price move 1.5 ATR your way before 1.5 ATR against you. About 50% is a coin flip, so only results well away from 50% with 30+ signals mean anything.', style: TextStyle(fontSize: 12)),
+            Text('Tests only: ${labKeep.join(', ')}. Every signal is a trade: entry at the signal candle\'s close, target 1.5 ATR, '
+                'stop 1.5 ATR (1:1), judged over the next $labHorizonBars candles, 0.05R fee. Timed out = neither hit, closed at the last price. '
+                'An indicator that stays in its zone for several candles gives a signal on each of them.', style: const TextStyle(fontSize: 12)),
             const SizedBox(height: 6),
             const Text('Coins to follow', style: TextStyle(fontSize: 12)),
             Wrap(spacing: 8, children: [
@@ -4927,49 +4985,63 @@ class _HomeState extends State<Home> {
           ]),
         ),
       ),
-      if (labAgg.isEmpty)
-        const Padding(padding: EdgeInsets.all(24), child: Text('No scored signals yet. Turn the Lab on and keep the app open. The first results arrive about 90 minutes later (6 candles on 15m), 6 hours for 1h, a day for 4h and 6 days for 1d. Everything is saved on the phone between sessions.', textAlign: TextAlign.center))
-      else ...[
+      Wrap(spacing: 8, children: [for (final x in styles) ChoiceChip(label: Text(x), selected: labStyle == x, onSelected: (_) => setState(() { labStyle = x; labShown = 50; }))]),
+      Wrap(spacing: 8, children: [for (final x in const ['All', 'BUY', 'SELL']) ChoiceChip(label: Text(x), selected: labSide == x, onSelected: (_) => setState(() { labSide = x; labShown = 50; }))]),
+      const Padding(padding: EdgeInsets.fromLTRB(4, 10, 4, 2), child: Text('Indicators (tap one to see all its trades)', style: TextStyle(fontWeight: FontWeight.w600))),
+      for (final n in order)
+        Card(
+          color: labSel == n ? Theme.of(context).colorScheme.primaryContainer : null,
+          child: ListTile(
+            dense: true,
+            onTap: () => setState(() { labSel = labSel == n ? null : n; labShown = 50; }),
+            title: Text(n, style: const TextStyle(fontWeight: FontWeight.w600)),
+            subtitle: Text(stats[n]!.n + stats[n]!.open == 0 ? 'No signals yet' : stats[n]!.text, style: const TextStyle(fontSize: 12)),
+            trailing: Text('${sg(stats[n]!.r)}R', style: TextStyle(fontWeight: FontWeight.w700, color: rc(stats[n]!.r))),
+          ),
+        ),
+      if (sel != null) ...[
         Card(
           child: Padding(
-            padding: const EdgeInsets.all(14),
+            padding: const EdgeInsets.all(12),
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              const Text('Trading styles: overall verdict accuracy', style: TextStyle(fontWeight: FontWeight.w700)),
-              const SizedBox(height: 4),
-              for (final e in styleSum.entries)
-                Padding(
-                  padding: const EdgeInsets.only(top: 3),
-                  child: e.value == null
-                      ? Text('${e.key}: collecting', style: const TextStyle(fontSize: 12))
-                      : Text('${e.key}: ${e.value![0].toInt()} signals, race win ${pct(raceWin(e.value!))}, direction right ${(100 * e.value![1] / e.value![0]).toStringAsFixed(0)}%, avg ${(e.value![4] / e.value![0]).toStringAsFixed(2)} ATR',
-                          style: TextStyle(fontSize: 12, color: wc(raceWin(e.value!), e.value![0]))),
+              Row(children: [
+                Expanded(child: Text('$sel: all trades', style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15))),
+                IconButton(
+                  tooltip: 'Download these trades',
+                  icon: const Icon(Icons.download),
+                  onPressed: list.isEmpty ? null : () => downloadCsv('lab_trades_${sel.replaceAll(RegExp(r'[^A-Za-z0-9]+'), '_')}.csv', labTradesCsv(list)),
                 ),
-              const SizedBox(height: 4),
-              const Text('Scalping = 15m (and 5m if added), Intraday = 1h, Swing = 4h, Position = 1d.', style: TextStyle(fontSize: 11)),
+              ]),
+              for (final g in [
+                {'title': 'By direction', 'm': splitBy((x) => x.side == 1 ? 'BUY' : 'SELL')},
+                {'title': 'By timeframe', 'm': splitBy((x) => x.s.tf)},
+              ]) ...[
+                Padding(padding: const EdgeInsets.only(top: 6), child: Text('${g['title']}', style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600))),
+                for (final e in (g['m'] as Map<String, LabStat>).entries)
+                  Text('${e.key}: ${e.value.text}', style: TextStyle(fontSize: 12, color: e.value.n == 0 ? null : rc(e.value.r))),
+              ],
+              const SizedBox(height: 6),
+              if (list.isEmpty) const Text('No trades yet for this filter.', style: TextStyle(fontSize: 12)),
+              for (final x in list.take(labShown))
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 3),
+                  child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Expanded(
+                      child: Text('${when(x.s.t0)}  ${x.side == 1 ? 'BUY' : 'SELL'} ${x.s.coin} ${x.s.tf}\n'
+                          'Entry ${fmtPrice(x.s.price)}  TP ${fmtPrice(x.tp)}  SL ${fmtPrice(x.sl)}'
+                          '${x.open ? '  (scored ${hhmm(x.s.t0.add(Duration(milliseconds: barMs(x.s.tf) * labHorizonBars)))})' : ''}',
+                          style: const TextStyle(fontSize: 12)),
+                    ),
+                    Text(x.open ? 'OPEN' : '${x.result}\n${sg(x.r)}R', textAlign: TextAlign.right,
+                        style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700,
+                            color: x.open ? Colors.grey : x.result == 'WIN' ? Colors.green : x.result == 'LOSS' ? Colors.red : Colors.orange)),
+                  ]),
+                ),
+              if (list.length > labShown)
+                TextButton(onPressed: () => setState(() => labShown += 50), child: Text('Show 50 more (${list.length - labShown} left)')),
             ]),
           ),
         ),
-        Wrap(spacing: 8, children: [for (final x in styles) ChoiceChip(label: Text(x), selected: labStyle == x, onSelected: (_) => setState(() => labStyle = x))]),
-        if (catSum.isNotEmpty) ...[
-          const Padding(padding: EdgeInsets.fromLTRB(4, 12, 4, 2), child: Text('Indicator families (pooled)', style: TextStyle(fontWeight: FontWeight.w600))),
-          for (final e in (catSum.entries.toList()..sort((a, b) => (raceWin(b.value) ?? 0).compareTo(raceWin(a.value) ?? 0))))
-            ListTile(
-              dense: true,
-              title: Text(e.key),
-              subtitle: Text('${e.value[0].toInt()} signals, direction right ${(100 * e.value[1] / e.value[0]).toStringAsFixed(0)}%'),
-              trailing: Text('race ${pct(raceWin(e.value))}', style: TextStyle(fontWeight: FontWeight.w600, color: wc(raceWin(e.value), e.value[0]))),
-            ),
-        ],
-        const Padding(padding: EdgeInsets.fromLTRB(4, 12, 4, 2), child: Text('Every indicator, best first', style: TextStyle(fontWeight: FontWeight.w600))),
-        Wrap(spacing: 6, children: [for (final x in cats) ChoiceChip(label: Text(x, style: const TextStyle(fontSize: 11)), selected: labCat == x, onSelected: (_) => setState(() => labCat = x))]),
-        if (entries.isEmpty) const Padding(padding: EdgeInsets.all(16), child: Text('No data for this style yet.')),
-        for (final e in entries.take(80))
-          ListTile(
-            dense: true,
-            title: Text(e.key),
-            subtitle: Text('${e.value[0].toInt()} signals${e.value[0] < minN ? ' (need $minN+)' : ''}, direction right ${(100 * e.value[1] / e.value[0]).toStringAsFixed(0)}%, avg ${(e.value[4] / e.value[0]).toStringAsFixed(2)} ATR'),
-            trailing: Text('race ${pct(raceWin(e.value))}', style: TextStyle(fontWeight: FontWeight.w600, color: wc(raceWin(e.value), e.value[0]))),
-          ),
       ],
       Card(
         child: Padding(
@@ -4977,7 +5049,8 @@ class _HomeState extends State<Home> {
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             const Text('Download Lab data', style: TextStyle(fontWeight: FontWeight.w700)),
             const SizedBox(height: 4),
-            const Text('Accuracy table: one row per indicator and style. Snapshots: the raw vote of every indicator at each signal with what happened next (last 1,500). Send these to tune the bot.', style: TextStyle(fontSize: 12)),
+            const Text('Accuracy table: one row per indicator and style. Snapshots: what the Lab indicators said at each signal and what happened next (last 6,000). '
+                'The download button on an indicator gives its trades.', style: TextStyle(fontSize: 12)),
             const SizedBox(height: 8),
             Wrap(spacing: 8, children: [
               ElevatedButton.icon(onPressed: downloadLabAcc, icon: const Icon(Icons.download), label: const Text('Download accuracy table')),
@@ -4988,7 +5061,8 @@ class _HomeState extends State<Home> {
           ]),
         ),
       ),
-      const Padding(padding: EdgeInsets.only(top: 8), child: Text('Collecting only happens while the app is open. Past results never guarantee future ones, and an indicator can look good over a short window by luck. Trust it only with hundreds of signals.', style: TextStyle(fontSize: 11))),
+      const Padding(padding: EdgeInsets.only(top: 8), child: Text('The Lab collects only while the app is open or minimized. The Experiments tab tests 40 indicators on GitHub 24/7. '
+          'A short good run can be luck: trust an indicator only after hundreds of trades.', style: TextStyle(fontSize: 11))),
     ]);
   }
 
