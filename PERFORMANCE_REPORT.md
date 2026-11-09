@@ -169,3 +169,15 @@ Walk-forward test on 2,201 closed GitHub bot trades (Oct 30 - Nov 9), using only
   * **Experiment lab** (new `experiments.py` + `.github/workflows/experiments.yml`, every 10 minutes): 40 indicators x top 30 OKX coins x 5m/15m/30m/1h/4h/1d. Each new signal opens a virtual trade at the next candle's open, followed to 1:1 and 1:2 targets (stop 1.5 ATR, 0.05R fee), one open trade per indicator/coin/timeframe. Results are published to the `exp-data` branch (a single commit replaced every run, so the repo does not grow) and shown in the new **Experiments** tab: by indicator, indicator + timeframe, coin, indicator + coin and timeframe, with PROVEN (50+ trades, PF > 1.1, profit in both halves) and LOSING labels.
 * Tests (`tests/test_experiments.py`): target/stop maths, no look-ahead (indicators on data up to a candle equal the values computed with later data), runs after every candle give the same totals as delayed catch-up runs, halves add up. On random simulated prices the lab shows no edge (49% wins at 1:1, loss after fees), as it should.
 * Not tested: real OKX responses from GitHub (same endpoint the bot already uses), and the Dart code was not compiled.
+
+## Update 9: Lab reduced to 7 indicators (10 since Update 10), with full trade lists
+* The app's Lab now records only RSI (2), CCI (20), Stochastic (14,3), Stochastic RSI, MFI (14), Bollinger %B (20,2) and Candle pattern. Older saved Lab data is trimmed to these 7 when the app starts. The OVERALL verdict rows are gone.
+* Every Lab signal is shown as a trade: entry at the signal candle's close, target and stop 1.5 ATR (1:1), judged over the next 6 candles, 0.05R fee. Result WIN / LOSS / TIMEOUT (neither hit, closed at the last price, capped at +/-1R) / OPEN (not scored yet).
+* Tap an indicator to see all its trades (newest first, 50 at a time), split by direction and timeframe, with a download button for that indicator's trades. Filters: style (Scalping / Intraday / Swing / Position) and BUY / SELL.
+* Up to 6,000 scored candles are kept (was 1,500 with about 50 indicators each).
+* Preview on the uploaded snapshots (98 rows, but only 3 candle times in one 45-minute dip, mostly SELL): RSI (2) +16.5R over 36, CCI (20) +18.5R over 54, Stochastic +13.6R over 43, Stochastic RSI +11.3R over 57, MFI +6.7R over 21, Bollinger %B +9.9R over 20, Candle pattern +7.6R over 50. One window, not evidence yet.
+* The Experiments tab (GitHub) still tests all 40 indicators, so the 7 can be compared with the rest.
+
+## Update 10: three more Lab indicators
+* Added RSI (14), Z-score (20) and Ultimate Oscillator to the Lab, which now records 10 indicators. Same trade rules and trade lists.
+* Preview on the same uploaded snapshots (one 45-minute window): RSI (14) +5.6R over 21, Z-score (20) +7.6R over 14, Ultimate Oscillator +0.8R over 3.
