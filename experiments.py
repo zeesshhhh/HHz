@@ -1,0 +1,494 @@
+"""Experiment lab. Runs in GitHub Actions (no phone needed), see .github/workflows/experiments.yml.
+
+Every indicator, on every coin and every timeframe, opens a virtual trade each time it gives a NEW signal
+(a flip or a level cross on a closed candle). The entry is the open of the next candle, so nothing is seen in
+advance. Each trade is followed to two targets at once, 1:1 and 1:2, with the stop at 1.5 ATR(14) and a 0.05R fee.
+One open trade per indicator, coin and timeframe at a time. Trades that reach neither target within the hold time are
+closed at the last price.
+
+Files (in EXP_DIR, published to the exp-data branch):
+  exp_state.json    open trades and the last candle processed per coin/timeframe
+  exp_stats.json    closed-trade totals per UTC day (kept for KEEP_DAYS days)
+  exp_summary.json  the table the app reads
+Self-contained on purpose: it does not import the bot's own files, so it works whatever version they are.
+"""
+import json
+import os
+import time
+from datetime import datetime, timezone
+
+import numpy as np
+import pandas as pd
+import requests
+
+OKX = "https://www.okx.com/api/v5"
+BAR = {"5m": "5m", "15m": "15m", "30m": "30m", "1h": "1H", "4h": "4H", "1d": "1Dutc"}
+HOLD = {"5m": 72, "15m": 48, "30m": 48, "1h": 48, "4h": 30, "1d": 10}      # bars: 6h, 12h, 24h, 48h, 5 days, 10 days
+TFS = [t for t in os.getenv("EXP_TFS", "5m,15m,30m,1h,4h,1d").split(",") if t in BAR]
+N_COINS = int(os.getenv("EXP_COINS", "30"))
+DIR = os.getenv("EXP_DIR", "expdata")
+KEEP_DAYS = 30
+FEE = 0.05
+SL_ATR = 1.5
+MIN_N = 50                                        # trades needed before a row can be called proven or losing
+EXCLUDE = {"USDC", "FDUSD", "TUSD", "DAI", "USDE", "BUSD", "USDP"}
+
+
+# ---------------------------------------------------------------- data
+def okx(path, params, tries=3):
+    for k in range(tries):
+        try:
+            r = requests.get(OKX + path, params=params, timeout=15)
+            if r.status_code == 200:
+                return r.json().get("data") or []
+        except Exception:
+            pass
+        time.sleep(1 + k)
+    return []
+
+
+def top_coins(n):
+    out = []
+    for t in okx("/market/tickers", {"instType": "SWAP"}):
+        inst = t.get("instId", "")
+        base = inst.split("-")[0]
+        if not inst.endswith("-USDT-SWAP") or base in EXCLUDE:
+            continue
+        try:
+            out.append((float(t["volCcy24h"]) * float(t["last"]), base))
+        except Exception:
+            pass
+    out.sort(reverse=True)
+    return [b for _, b in out[:n]]
+
+
+def candles(coin, tf):
+    """Last 300 candles, oldest first, with a 'closed' flag (OKX 'confirm')."""
+    rows = okx("/market/candles", {"instId": f"{coin}-USDT-SWAP", "bar": BAR[tf], "limit": "300"})
+    time.sleep(0.12)                                     # well inside OKX's 40 requests / 2 s
+    if not rows:
+        return None
+    df = pd.DataFrame([[x[0], x[1], x[2], x[3], x[4], x[5], x[8] if len(x) > 8 else "1"] for x in rows],
+                      columns=["ts", "open", "high", "low", "close", "volume", "confirm"])
+    df["ts"] = df["ts"].astype("int64")
+    for c in ("open", "high", "low", "close", "volume"):
+        df[c] = df[c].astype(float)
+    df["closed"] = df.pop("confirm").astype(str) == "1"
+    return df.sort_values("ts").reset_index(drop=True)
+
+
+# ---------------------------------------------------------------- indicator helpers
+def ema(x, n):
+    return pd.Series(x).ewm(span=n, adjust=False).mean().values
+
+
+def sma(x, n):
+    return pd.Series(x).rolling(n).mean().values
+
+
+def rma(x, n):
+    return pd.Series(x).ewm(alpha=1 / n, adjust=False).mean().values
+
+
+def wma(x, n):
+    w = np.arange(1, n + 1)
+    return pd.Series(x).rolling(n).apply(lambda a: np.dot(a, w) / w.sum(), raw=True).values
+
+
+def prev(a):
+    return np.r_[np.nan, a[:-1]]
+
+
+def flip(state):
+    """+1 / -1 on the candle where the sign changes to it, else 0."""
+    s = np.nan_to_num(np.sign(state))
+    p = np.r_[0, s[:-1]]
+    return np.where((s != p) & (s != 0) & (p != 0), s, 0)
+
+
+def up(a, lvl):
+    return (prev(a) <= lvl) & (a > lvl)
+
+
+def down(a, lvl):
+    return (prev(a) >= lvl) & (a < lvl)
+
+
+def events(up_mask, down_mask):
+    return np.where(up_mask, 1, np.where(down_mask, -1, 0))
+
+
+def true_range(h, l, c):
+    pc = prev(c)
+    return np.nanmax(np.vstack([h - l, np.abs(h - pc), np.abs(l - pc)]), axis=0)
+
+
+def atr(h, l, c, n=14):
+    return rma(true_range(h, l, c), n)
+
+
+def rsi(c, n):
+    d = np.diff(c, prepend=c[0])
+    g, ls = rma(np.clip(d, 0, None), n), rma(np.clip(-d, 0, None), n)
+    rs = np.divide(g, ls, out=np.full_like(g, np.inf), where=ls > 0)
+    return 100 - 100 / (1 + rs)
+
+
+def hh(a, n):
+    return pd.Series(a).rolling(n).max().values
+
+
+def ll(a, n):
+    return pd.Series(a).rolling(n).min().values
+
+
+def supertrend(h, l, c, n=10, m=3.0):
+    a = atr(h, l, c, n)
+    mid = (h + l) / 2
+    ub, lb = mid + m * a, mid - m * a
+    d = np.zeros(len(c))
+    fu, fl = ub.copy(), lb.copy()
+    for i in range(1, len(c)):
+        fu[i] = ub[i] if (ub[i] < fu[i - 1] or c[i - 1] > fu[i - 1]) else fu[i - 1]
+        fl[i] = lb[i] if (lb[i] > fl[i - 1] or c[i - 1] < fl[i - 1]) else fl[i - 1]
+        d[i] = 1 if c[i] > fu[i - 1] else -1 if c[i] < fl[i - 1] else d[i - 1]
+    return d
+
+
+def psar(h, l, step=0.02, mx=0.2):
+    n = len(h)
+    d = np.zeros(n)
+    if n < 3:
+        return d
+    bull, af, ep, sar = True, step, h[0], l[0]
+    for i in range(1, n):
+        sar = sar + af * (ep - sar)
+        if bull:
+            sar = min(sar, l[i - 1], l[i - 2] if i > 1 else l[i - 1])
+            if l[i] < sar:
+                bull, sar, ep, af = False, ep, l[i], step
+            elif h[i] > ep:
+                ep, af = h[i], min(af + step, mx)
+        else:
+            sar = max(sar, h[i - 1], h[i - 2] if i > 1 else h[i - 1])
+            if h[i] > sar:
+                bull, sar, ep, af = True, ep, h[i], step
+            elif l[i] < ep:
+                ep, af = l[i], min(af + step, mx)
+        d[i] = 1 if bull else -1
+    return d
+
+
+def chandelier(h, l, c, n=22, m=3.0):
+    a = atr(h, l, c, n)
+    ls, ss = hh(h, n) - m * a, ll(l, n) + m * a
+    d = np.zeros(len(c))
+    for i in range(1, len(c)):
+        d[i] = 1 if c[i] > ss[i - 1] else -1 if c[i] < ls[i - 1] else d[i - 1]
+    return d
+
+
+def heikin(o, h, l, c):
+    hc = (o + h + l + c) / 4
+    ho = np.zeros(len(c))
+    ho[0] = (o[0] + c[0]) / 2
+    for i in range(1, len(c)):
+        ho[i] = (ho[i - 1] + hc[i - 1]) / 2
+    return hc - ho
+
+
+def indicators(df):
+    """name -> array of +1 (new BUY signal), -1 (new SELL signal) or 0, one value per candle."""
+    o, h, l, c, v = (df[k].values for k in ("open", "high", "low", "close", "volume"))
+    e9, e20, e21, e50, e200 = ema(c, 9), ema(c, 20), ema(c, 21), ema(c, 50), ema(c, 200)
+    macd = ema(c, 12) - ema(c, 26)
+    r14, r2 = rsi(c, 14), rsi(c, 2)
+    a10, a14 = atr(h, l, c, 10), atr(h, l, c, 14)
+    sd20 = pd.Series(c).rolling(20).std().values
+    bu, bl = sma(c, 20) + 2 * sd20, sma(c, 20) - 2 * sd20
+    tp = (h + l + c) / 3
+    md = pd.Series(tp).rolling(20).apply(lambda a: np.mean(np.abs(a - a.mean())), raw=True).values
+    cci = (tp - sma(tp, 20)) / (0.015 * md)
+    k = 100 * (c - ll(l, 14)) / (hh(h, 14) - ll(l, 14))
+    k = sma(k, 3)
+    dk = sma(k, 3)
+    wr = -100 * (hh(h, 14) - c) / (hh(h, 14) - ll(l, 14))
+    up_m, dn_m = h - prev(h), prev(l) - l
+    pdm = np.where((up_m > dn_m) & (up_m > 0), up_m, 0.0)
+    mdm = np.where((dn_m > up_m) & (dn_m > 0), dn_m, 0.0)
+    trr = rma(true_range(h, l, c), 14)
+    pdi, mdi = 100 * rma(pdm, 14) / trr, 100 * rma(mdm, 14) / trr
+    with np.errstate(invalid="ignore", divide="ignore"):
+        dx = 100 * np.abs(pdi - mdi) / (pdi + mdi)
+    adx = rma(np.nan_to_num(dx), 14)
+    au = 100 * (25 - pd.Series(h).rolling(26).apply(lambda a: 25 - np.argmax(a), raw=True).values) / 25
+    ad = 100 * (25 - pd.Series(l).rolling(26).apply(lambda a: 25 - np.argmin(a), raw=True).values) / 25
+    tenkan, kijun = (hh(h, 9) + ll(l, 9)) / 2, (hh(h, 26) + ll(l, 26)) / 2
+    rmf = tp * v
+    pos = pd.Series(np.where(tp > prev(tp), rmf, 0.0)).rolling(14).sum().values
+    neg = pd.Series(np.where(tp < prev(tp), rmf, 0.0)).rolling(14).sum().values
+    mfi = 100 - 100 / (1 + np.divide(pos, neg, out=np.full_like(pos, np.inf), where=neg > 0))
+    obv = np.cumsum(np.sign(np.diff(c, prepend=c[0])) * v)
+    mfm = np.divide((c - l) - (h - c), h - l, out=np.zeros_like(c), where=(h - l) > 0)
+    cmf = pd.Series(mfm * v).rolling(20).sum().values / pd.Series(v).rolling(20).sum().values
+    z = (c - sma(c, 20)) / sd20
+    roc = 100 * (c / np.r_[np.full(12, np.nan), c[:-12]] - 1)
+    t3 = ema(ema(ema(c, 15), 15), 15)
+    trix = 100 * (t3 / prev(t3) - 1)
+    vmp = pd.Series(np.abs(h - prev(l))).rolling(14).sum().values
+    vmm = pd.Series(np.abs(l - prev(h))).rolling(14).sum().values
+    trs = pd.Series(true_range(h, l, c)).rolling(14).sum().values
+    hull = wma(2 * wma(c, 4) - wma(c, 9), 3)
+    vwap = pd.Series(tp * v).rolling(50).sum().values / pd.Series(v).rolling(50).sum().values
+    mid = (h + l) / 2
+    ao = sma(mid, 5) - sma(mid, 34)
+    body, pbody = c - o, prev(c) - prev(o)
+    eng_up = (pbody < 0) & (body > 0) & (c >= prev(o)) & (o <= prev(c))
+    eng_dn = (pbody > 0) & (body < 0) & (c <= prev(o)) & (o >= prev(c))
+    t = np.arange(len(c), dtype=float)
+    m = lambda a: pd.Series(a).rolling(50).mean().values
+    slope = (m(t * c) - m(t) * m(c)) / (m(t * t) - m(t) ** 2)          # least-squares slope over 50 candles
+    bp = c - np.minimum(l, prev(c))
+    trn = np.maximum(h, prev(c)) - np.minimum(l, prev(c))
+    s = lambda a, n: pd.Series(a).rolling(n).sum().values
+    uo = 100 * (4 * s(bp, 7) / s(trn, 7) + 2 * s(bp, 14) / s(trn, 14) + s(bp, 28) / s(trn, 28)) / 7
+    ku, kl = e20 + 2 * a10, e20 - 2 * a10
+    squeeze = (bu < ku) & (bl > kl)
+    release = np.r_[False, squeeze[:-1]] & ~squeeze
+    vol_surge = (v > 2 * sma(v, 20)) & (np.abs(body) > 0.5 * (h - l))
+    return {
+        "EMA 9/21 cross": flip(e9 - e21),
+        "EMA 20/50 cross": flip(e20 - e50),
+        "EMA 50/200 cross": flip(e50 - e200),
+        "Price vs EMA 200": flip(c - e200),
+        "SMA 10/30 cross": flip(sma(c, 10) - sma(c, 30)),
+        "MACD signal cross": flip(macd - ema(macd, 9)),
+        "MACD zero cross": flip(macd),
+        "RSI 14 crosses 50": flip(r14 - 50),
+        "RSI 14 30/70 reversal": events(up(r14, 30), down(r14, 70)),
+        "RSI 2 10/90 reversal": events(up(r2, 10), down(r2, 90)),
+        "Stochastic 14,3 cross in zone": events(up(k - dk, 0) & (dk < 20), down(k - dk, 0) & (dk > 80)),
+        "CCI 20 breakout": events(up(cci, 100), down(cci, -100)),
+        "CCI 20 reversal": events(up(cci, -100), down(cci, 100)),
+        "Bollinger breakout": events(up(c - bu, 0), down(c - bl, 0)),
+        "Bollinger reversal": events(up(c - bl, 0), down(c - bu, 0)),
+        "Keltner breakout": events(up(c - ku, 0), down(c - kl, 0)),
+        "Donchian 20 breakout": events(up(c - prev(hh(h, 20)), 0), down(c - prev(ll(l, 20)), 0)),
+        "Supertrend 10,3": flip(supertrend(h, l, c)),
+        "Parabolic SAR": flip(psar(h, l)),
+        "ADX DI cross (ADX 20+)": np.where(adx > 20, flip(pdi - mdi), 0),
+        "Aroon 25 cross": flip(au - ad),
+        "Ichimoku TK cross": flip(tenkan - kijun),
+        "Williams %R reversal": events(up(wr, -80), down(wr, -20)),
+        "MFI 14 reversal": events(up(mfi, 20), down(mfi, 80)),
+        "OBV vs EMA 21": flip(obv - ema(obv, 21)),
+        "Chaikin Money Flow 20": flip(cmf),
+        "Z-score 20 reversal": events(up(z, -2), down(z, 2)),
+        "ROC 12 zero cross": flip(roc),
+        "TRIX 15 signal cross": flip(trix - ema(np.nan_to_num(trix), 9)),
+        "Vortex 14 cross": flip(vmp / trs - vmm / trs),
+        "Heikin-Ashi color": flip(heikin(o, h, l, c)),
+        "Hull MA 9 slope": flip(hull - prev(hull)),
+        "VWAP 50 cross": flip(c - vwap),
+        "Awesome Oscillator": flip(ao),
+        "Engulfing candle": events(eng_up, eng_dn),
+        "Linear regression 50 slope": flip(slope),
+        "Chandelier exit 22,3": flip(chandelier(h, l, c)),
+        "Ultimate oscillator reversal": events(up(uo, 30), down(uo, 70)),
+        "Squeeze release": np.where(release, np.sign(c - sma(c, 20)), 0),
+        "Volume surge candle": np.where(vol_surge, np.sign(body), 0),
+    }, a14
+
+
+# ---------------------------------------------------------------- trades
+def step(tr, hi, lo, cl, hold):
+    """Advance one open trade by one closed candle. Both targets share the stop. Stop first if both touch in one candle."""
+    side, e, rk = tr["s"], tr["e"], tr["r"]
+    sl = e - side * rk
+    hit_sl = lo <= sl if side == 1 else hi >= sl
+    for key, mult in (("o1", 1), ("o2", 2)):
+        if tr[key] is not None:
+            continue
+        tp = e + side * mult * rk
+        if hit_sl:
+            tr[key] = round(-1 - FEE, 3)
+        elif (hi >= tp if side == 1 else lo <= tp):
+            tr[key] = round(mult - FEE, 3)
+    tr["b"] += 1
+    if tr["b"] >= hold:
+        for key, mult in (("o1", 1), ("o2", 2)):
+            if tr[key] is None:
+                tr[key] = round(min(max((cl - e) * side / rk, -1.0), float(mult)) - FEE, 3)
+    return tr["o1"] is not None and tr["o2"] is not None
+
+
+def add_stat(stats, tr):
+    day = tr["d"]
+    sd = "BUY" if tr["s"] == 1 else "SELL"
+    keys = ["all", f"I|{tr['k']}|{sd}", f"i|{tr['k']}|{tr['tf']}|{sd}", f"c|{tr['c']}|{sd}",
+            f"t|{tr['tf']}|{sd}", f"ic|{tr['k']}|{sd}|{tr['c']}"]
+    bucket = stats.setdefault(day, {})
+    for k in keys:
+        a = bucket.setdefault(k, [0, 0, 0.0, 0.0, 0, 0.0, 0.0])    # n, wins 1:1, R 1:1, losses 1:1, wins 1:2, R 1:2, losses 1:2
+        a[0] += 1
+        for j, r in ((1, tr["o1"]), (4, tr["o2"])):
+            if r > 0:
+                a[j] += 1
+            else:
+                a[j + 2] = round(a[j + 2] - r, 3)
+            a[j + 1] = round(a[j + 1] + r, 3)
+
+
+def process(coin, tf, df, st, stats):
+    """Resolve open trades with newly closed candles, then open trades for new signals. Returns signals opened."""
+    if df is None or len(df) < 230:
+        return 0
+    cl = df[df["closed"]].reset_index(drop=True)
+    if len(cl) < 220:
+        return 0
+    key = f"{coin}|{tf}"
+    last = st["last"].get(key)
+    ts = cl["ts"].values
+    # 1) open trades of this coin / timeframe
+    keep, freed = [], {}                                   # freed: indicator -> time its trade closed in this run
+    for tr in st["open"]:
+        if tr["c"] != coin or tr["tf"] != tf:
+            keep.append(tr)
+            continue
+        done = False
+        for i in np.where(ts > tr["chk"])[0]:
+            done = step(tr, cl["high"].iat[i], cl["low"].iat[i], cl["close"].iat[i], HOLD[tf])
+            tr["chk"] = int(ts[i])
+            if done:
+                break
+        if done:
+            add_stat(stats, tr)
+            freed[tr["k"]] = tr["chk"]
+        else:
+            keep.append(tr)
+    st["open"] = keep
+    # 2) new signals on candles closed since the last run (first run: only the newest closed candle)
+    new_idx = [len(cl) - 1] if last is None else [i for i in np.where(ts > last)[0]]
+    st["last"][key] = int(ts[-1])
+    if not new_idx:
+        return 0
+    sig, a14 = indicators(cl)
+    busy = dict(freed)                                      # name -> busy until (ms); still open = forever
+    busy.update({tr["k"]: float("inf") for tr in st["open"] if tr["c"] == coin and tr["tf"] == tf})
+    opened = 0
+    for i in new_idx:
+        if np.isnan(a14[i]) or a14[i] <= 0:
+            continue
+        if i + 1 < len(cl):
+            entry, ets = cl["open"].iat[i + 1], int(ts[i + 1])
+        else:
+            nxt = df[~df["closed"]]
+            if nxt.empty:
+                continue
+            entry, ets = float(nxt["open"].iat[0]), int(nxt["ts"].iat[0])
+        for name, arr in sig.items():
+            side = int(arr[i])
+            if side == 0 or ts[i] < busy.get(name, -1):
+                continue
+            tr = {"k": name, "c": coin, "tf": tf, "s": side, "e": float(entry), "r": float(SL_ATR * a14[i]),
+                  "chk": ets - 1, "b": 0, "o1": None, "o2": None,
+                  "d": datetime.fromtimestamp(ets / 1000, timezone.utc).strftime("%Y-%m-%d")}
+            # catch-up: candles after the entry that are already closed resolve the trade right away
+            done = False
+            for j in np.where(ts >= ets)[0]:
+                done = step(tr, cl["high"].iat[j], cl["low"].iat[j], cl["close"].iat[j], HOLD[tf])
+                tr["chk"] = int(ts[j])
+                if done:
+                    break
+            if done:
+                add_stat(stats, tr)
+                busy[name] = tr["chk"]                       # no overlapping trade for this indicator
+            else:
+                st["open"].append(tr)
+                busy[name] = float("inf")
+            opened += 1
+    return opened
+
+
+# ---------------------------------------------------------------- summary
+def summary(stats, st, coins, run_info):
+    days = sorted(stats)
+    tot = sum(stats[d].get("all", [0])[0] for d in days)
+    split, acc = (days[0] if days else ""), 0
+    for d in days:                                      # first day of the newer half (by trade count)
+        acc += stats[d].get("all", [0])[0]
+        if acc >= tot / 2:
+            split = d
+            break
+    agg = {}
+    for d in days:
+        newer = d > split if len(days) > 1 else False
+        for k, a in stats[d].items():
+            t = agg.setdefault(k, [0, 0, 0.0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            for j in range(7):
+                t[j] += a[j]
+            t[8 if newer else 7] += a[2]
+            t[10 if newer else 9] += a[5]
+    rows = {}
+    for k, t in agg.items():
+        n = t[0]
+        pf = lambda r, loss: round((r + loss) / loss, 2) if loss > 0 else (99.0 if r > 0 else 0.0)
+        rows[k] = [n, round(100 * t[1] / n, 1), round(t[2], 2), pf(t[2], t[3]), round(t[7], 2), round(t[8], 2),
+                   round(100 * t[4] / n, 1), round(t[5], 2), pf(t[5], t[6]), round(t[9], 2), round(t[10], 2)]
+    return {"updated": datetime.now(timezone.utc).isoformat(timespec="seconds"), "coins": coins, "tfs": TFS,
+            "open": len(st["open"]), "closed": tot, "days": [days[0], days[-1]] if days else [], "split": split,
+            "min_n": MIN_N, "fee": FEE, "sl_atr": SL_ATR, "run": run_info,
+            "cols": ["n", "win_1to1", "R_1to1", "pf_1to1", "R_1to1_older", "R_1to1_newer",
+                     "win_1to2", "R_1to2", "pf_1to2", "R_1to2_older", "R_1to2_newer"],
+            "rows": rows}
+
+
+def load(name, default):
+    try:
+        with open(os.path.join(DIR, name)) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save(name, obj):
+    os.makedirs(DIR, exist_ok=True)
+    tmp = os.path.join(DIR, name + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(obj, f, separators=(",", ":"))
+    os.replace(tmp, os.path.join(DIR, name))
+
+
+def main():
+    t0 = time.time()
+    st = load("exp_state.json", {"open": [], "last": {}, "coins": []})
+    stats = load("exp_stats.json", {})
+    coins = top_coins(N_COINS) or st.get("coins") or ["BTC", "ETH", "SOL"]
+    # coins that dropped out of the top list keep being followed until their open trades close
+    follow = list(dict.fromkeys(coins + sorted({t["c"] for t in st["open"]})))
+    opened = errors = 0
+    for coin in follow:
+        for tf in TFS:
+            in_top = coin in coins
+            if not in_top and not any(t["c"] == coin and t["tf"] == tf for t in st["open"]):
+                continue
+            try:
+                df = candles(coin, tf)
+                if not in_top and df is not None and df["closed"].any():
+                    st["last"][f"{coin}|{tf}"] = int(df.loc[df["closed"], "ts"].max())   # resolve only, no new trades
+                opened += process(coin, tf, df, st, stats)
+            except Exception as e:
+                errors += 1
+                print(f"{coin} {tf}: {e}")
+    cutoff = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=KEEP_DAYS)).strftime("%Y-%m-%d")
+    stats = {d: v for d, v in stats.items() if d >= cutoff}
+    st["coins"] = coins
+    info = {"opened": opened, "errors": errors, "seconds": round(time.time() - t0, 1)}
+    save("exp_state.json", st)
+    save("exp_stats.json", stats)
+    save("exp_summary.json", summary(stats, st, coins, info))
+    print(f"coins {len(coins)}, timeframes {len(TFS)}, opened {opened}, open now {len(st['open'])}, errors {errors}, {info['seconds']}s")
+
+
+if __name__ == "__main__":
+    main()
