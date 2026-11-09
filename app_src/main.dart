@@ -1407,7 +1407,72 @@ String tradesToCsv(List<AppTrade> trades) {
   return lines.join('\n') + '\n';
 }
 
-String stratLabel(AppTrade t) => t.source == 'auto' ? 'Trend (auto)' : t.source == 'MR' ? 'Mean reversion (MR)' : 'Manual';
+String stratLabel(AppTrade t) => t.source == 'auto' ? 'Trend (auto)' : t.source == 'MR' ? 'Mean reversion (MR)'
+    : t.source == 'BOT' ? 'Bot: ${t.verdict}' : 'Manual';
+
+/// Minimal CSV parser (quoted fields, commas and line breaks inside quotes).
+List<List<String>> parseCsv(String text) {
+  final rows = <List<String>>[];
+  var row = <String>[];
+  final f = StringBuffer();
+  var q = false;
+  for (var i = 0; i < text.length; i++) {
+    final ch = text[i];
+    if (q) {
+      if (ch == '"') {
+        if (i + 1 < text.length && text[i + 1] == '"') { f.write('"'); i++; } else { q = false; }
+      } else {
+        f.write(ch);
+      }
+    } else if (ch == '"') {
+      q = true;
+    } else if (ch == ',') {
+      row.add(f.toString()); f.clear();
+    } else if (ch == '\n' || ch == '\r') {
+      if (ch == '\r' && i + 1 < text.length && text[i + 1] == '\n') i++;
+      row.add(f.toString()); f.clear();
+      if (row.length > 1 || row.first.isNotEmpty) rows.add(row);
+      row = <String>[];
+    } else {
+      f.write(ch);
+    }
+  }
+  if (f.isNotEmpty || row.isNotEmpty) { row.add(f.toString()); rows.add(row); }
+  return rows;
+}
+
+/// Track record of one group of the GitHub bot's closed paper trades.
+class BotRec {
+  int n = 0, wins = 0;
+  double sumR = 0, gw = 0, gl = 0;
+  void add(double r) { n++; sumR += r; if (r > 0) { wins++; gw += r; } else { gl += -r; } }
+  double get pf => gl == 0 ? (gw > 0 ? 99.0 : 0.0) : gw / gl;
+  double get winPct => n == 0 ? 0 : 100.0 * wins / n;
+  String get text => '$n trades, ${winPct.toStringAsFixed(0)}% wins, ${sumR >= 0 ? '+' : ''}${sumR.toStringAsFixed(1)}R, PF ${pf.toStringAsFixed(2)}';
+}
+
+/// One row of the GitHub bot's paper log.
+class BotTrade {
+  final String key, sym, side, strat, tf, status;
+  final DateTime opened;
+  final DateTime? closed;
+  final double? r;
+  BotTrade(this.key, this.sym, this.side, this.strat, this.tf, this.status, this.opened, this.closed, this.r);
+}
+
+/// Focus rule, tested walk-forward on 2,201 closed bot trades (Oct 30 - Nov 9): a signal counts only when its
+/// strategy + direction already has 30+ closed bot trades with a net profit. All trades -70.8R, focus trades +81.4R
+/// (PF 1.21, positive in both halves). Held for thresholds 25 to 50. Uses the bot's own stop and target.
+const botFocusMinN = 30;
+bool botRecFocus(BotRec? r) => r != null && r.n >= botFocusMinN && r.sumR > 0;
+
+/// Bot symbol to Binance coin: 'WLD-USDT' -> 'WLD', 'BTC-USD' -> 'BTC'. Forex / Yahoo futures return null.
+String? botCoin(String sym) {
+  if (sym.contains('=')) return null;
+  final i = sym.indexOf('-');
+  final c = i > 0 ? sym.substring(0, i) : sym;
+  return futSymbols.containsKey(c) ? c : null;
+}
 
 /// Profit breakdown, one row per (dimension, key): which coins, timeframes, indicators, sides, hours and regimes make money.
 /// Only closed trades count; results are net of the paper fee. Rows with fewer than 10 trades are labelled "too few trades".
@@ -1731,6 +1796,26 @@ class _HomeState extends State<Home> {
   List<AppTrade> trades = [];
   bool autoPaper = false, paperBusy = false;
   double paperMinScore = 0.50;
+  Map<String, BotRec> botRec = {};      // 'strategy|SIDE' and 'symbol|SIDE' -> bot track record
+  DateTime? botRecAt;
+  String? botRecError;
+  Timer? botRecTimer;
+  BotRec botFocusAcc = BotRec(), botFocusToday = BotRec();   // bot trades that were focus when they opened (runs on GitHub)
+  int botFocusOpen = 0;
+  List<BotTrade> botFocusRecent = [];
+  Map<String, dynamic>? expData;                                // Experiment lab summary (exp-data branch)
+  String? expError;
+  DateTime? expAt;
+  Timer? expTimer;
+  String expView = 'I', expTf = 'All';
+  int expTarget = 1, expMinN = 20;
+  bool expProvenOnly = false, expWorst = false;
+  int paperSource = 1;                  // 0 = app indicators, 1 = bot focus signals, 2 = both
+  bool sigFocusOnly = true;             // Signals tab: show only focus signals
+  final Set<String> botSeen = {};       // bot signals already handled
+  bool botFollowBusy = false;
+  String botStatus = '';
+  int focusSkipped = 0;   // signals the Focus filter skipped this session
   int focusMode = 0;   // 0 off, 1 skip coin/direction/indicator combos that lost in both halves, 2 only proven combos
   int _focusKey = -1;
   Map<String, Edge> _focusEdges = {};
@@ -1779,6 +1864,10 @@ class _HomeState extends State<Home> {
     super.initState();
     load();
     timer = Timer.periodic(const Duration(seconds: 30), (_) => load(silent: true));
+    loadBotRec();
+    botRecTimer = Timer.periodic(const Duration(minutes: 10), (_) => loadBotRec());
+    loadExp();
+    expTimer = Timer.periodic(const Duration(minutes: 10), (_) => loadExp());
     loadMarket();
     marketTimer = Timer.periodic(const Duration(seconds: 1), (_) => loadMarket(silent: true));
     loadFutures();
@@ -1792,6 +1881,7 @@ class _HomeState extends State<Home> {
     loadPaper();
     paperTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       checkPaper();
+      followBotSignals();
       paperScanCycle();
     });
     uiTimer = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -1817,6 +1907,8 @@ class _HomeState extends State<Home> {
     newsTimer?.cancel();
     alertTimer?.cancel();
     paperTimer?.cancel();
+    botRecTimer?.cancel();
+    expTimer?.cancel();
     labTimer?.cancel();
     uiTimer?.cancel();
     liveTick.dispose();
@@ -2104,6 +2196,9 @@ class _HomeState extends State<Home> {
       paperAmount = p.getDouble('app_paper_amount') ?? 0;
       paperMr = p.getBool('app_paper_mr') ?? false;
       focusMode = (p.getInt('app_paper_focus') ?? 0).clamp(0, 2).toInt();
+      paperSource = (p.getInt('app_paper_src') ?? 1).clamp(0, 2).toInt();   // new installs and updates start on bot focus signals
+      sigFocusOnly = p.getBool('app_sig_focus') ?? true;
+      botSeen..clear()..addAll(p.getStringList('app_bot_seen') ?? const <String>[]);
       planRR = p.getDouble('app_paper_rr') ?? 1.0;
       if (planRR.isNaN || planRR < 0.5 || planRR > 10) planRR = 1.0;
       rrCtl.text = const [1.0, 1.5, 2.0].contains(planRR) ? '' : fmtRR(planRR);
@@ -2123,11 +2218,6 @@ class _HomeState extends State<Home> {
         await p.setBool('app_paper_v6', true);
         await p.setStringList('app_paper_tfs', paperTfs.toList());
       }
-      if (!(p.getBool('app_paper_v4') ?? false)) {
-        paperMaxOpen = 1000000;                       // no limit on open paper trades
-        await p.setBool('app_paper_v4', true);
-        await p.setInt('app_paper_max', paperMaxOpen);
-      }
       if (!(p.getBool('app_paper_v3') ?? false)) {
         // Conservative migration based on the supplied paper-trade CSV: pause 15m/30m/1d
         // auto entries until they are independently validated; manual scanning remains available.
@@ -2145,6 +2235,11 @@ class _HomeState extends State<Home> {
         await p.setInt('app_paper_coins', paperCoins);
         await p.setInt('app_paper_q', paperMinQ);
         await p.setStringList('app_paper_tfs', paperTfs.toList());
+      }
+      if (!(p.getBool('app_paper_v4') ?? false)) {
+        paperMaxOpen = 1000000;                       // no limit on open paper trades
+        await p.setBool('app_paper_v4', true);
+        await p.setInt('app_paper_max', paperMaxOpen);
       }
     } catch (_) {}
     paperLoaded = true;
@@ -2167,6 +2262,9 @@ class _HomeState extends State<Home> {
       await p.setDouble('app_paper_amount', paperAmount);
       await p.setBool('app_paper_mr', paperMr);
       await p.setInt('app_paper_focus', focusMode);
+      await p.setInt('app_paper_src', paperSource);
+      await p.setBool('app_sig_focus', sigFocusOnly);
+      await p.setStringList('app_bot_seen', botSeen.toList().reversed.take(400).toList().reversed.toList());
       await p.setDouble('app_paper_rr', planRR);
       await p.setInt('app_paper_q', paperMinQ);
       await p.setInt('app_paper_adx', paperMinAdx);
@@ -2176,6 +2274,294 @@ class _HomeState extends State<Home> {
   }
 
   double get paperEquity => paperStart + trades.where((t) => !t.isOpen).fold(0.0, (a, t) => a + t.pnl);
+
+  /// Downloads the GitHub bot's paper log and builds its track record per strategy + direction and coin + direction.
+  Future<void> loadBotRec() async {
+    if (feedUrl.isEmpty) return;
+    try {
+      final url = feedUrl.replaceAll('feed.json', 'paper_log.csv');
+      final r = await http.get(Uri.parse('$url?t=${DateTime.now().millisecondsSinceEpoch}')).timeout(const Duration(seconds: 30));
+      if (r.statusCode != 200) throw 'HTTP ${r.statusCode}';
+      final rows = parseCsv(r.body);
+      if (rows.isEmpty) throw 'empty file';
+      final h = rows.first;
+      final iS = h.indexOf('strategy'), iSide = h.indexOf('side'), iSym = h.indexOf('symbol'), iSt = h.indexOf('status'), iR = h.indexOf('r_multiple');
+      final iO = h.indexOf('opened_utc'), iC = h.indexOf('closed_utc'), iTf = h.indexOf('tf');
+      if (iS < 0 || iSide < 0 || iSym < 0 || iSt < 0 || iR < 0) throw 'unexpected columns';
+      // focus account: replay the log in time order and keep the trades that were focus when they opened
+      if (iO >= 0 && iC >= 0) {
+        final all = <BotTrade>[];
+        for (final row in rows.skip(1)) {
+          if (row.length <= math.max(iR, math.max(iO, iC))) continue;
+          final o = DateTime.tryParse(row[iO]);
+          if (o == null) continue;
+          all.add(BotTrade('${row[iS]}|${row[iSide]}', row[iSym], row[iSide], row[iS], iTf >= 0 ? row[iTf] : '', row[iSt], o,
+              DateTime.tryParse(row[iC]), double.tryParse(row[iR])));
+        }
+        final byOpen = [...all]..sort((a, b) => a.opened.compareTo(b.opened));
+        final done = all.where((t) => t.status == 'closed' && t.closed != null && t.r != null).toList()
+          ..sort((a, b) => a.closed!.compareTo(b.closed!));
+        final run = <String, BotRec>{};
+        final acc = BotRec(), today = BotRec(), recent = <BotTrade>[];
+        final day = DateTime.now().toUtc();
+        var j = 0, openN = 0;
+        for (final t in byOpen) {
+          while (j < done.length && done[j].closed!.isBefore(t.opened)) {
+            run.putIfAbsent(done[j].key, () => BotRec()).add(done[j].r!);
+            j++;
+          }
+          if (!botRecFocus(run[t.key])) continue;
+          recent.add(t);
+          if (t.status == 'closed' && t.r != null) {
+            acc.add(t.r!);
+            final c = t.closed?.toUtc();
+            if (c != null && c.year == day.year && c.month == day.month && c.day == day.day) today.add(t.r!);
+          } else if (t.status == 'open') {
+            openN++;
+          }
+        }
+        botFocusAcc = acc;
+        botFocusToday = today;
+        botFocusOpen = openN;
+        botFocusRecent = recent.reversed.take(15).toList();
+      }
+      final m = <String, BotRec>{};
+      for (final row in rows.skip(1)) {
+        if (row.length <= iR || row[iSt] != 'closed') continue;
+        final rr = double.tryParse(row[iR]);
+        if (rr == null) continue;
+        m.putIfAbsent('${row[iS]}|${row[iSide]}', () => BotRec()).add(rr);
+        m.putIfAbsent('sym:${row[iSym]}|${row[iSide]}', () => BotRec()).add(rr);
+        m.putIfAbsent('side:${row[iSide]}', () => BotRec()).add(rr);
+        m.putIfAbsent('all', () => BotRec()).add(rr);
+      }
+      botRec = m;
+      botRecAt = DateTime.now();
+      botRecError = null;
+    } catch (e) {
+      botRecError = 'Bot track record could not load ($e).';
+    }
+    if (mounted) setState(() {});
+  }
+
+  String? expUrl() {
+    final u = Uri.tryParse(feedUrl);
+    if (feedUrl.isEmpty || u == null || u.pathSegments.length < 3) return null;
+    return Uri.https(u.host, '/${u.pathSegments[0]}/${u.pathSegments[1]}/exp-data/exp_summary.json').toString();
+  }
+
+  Future<void> loadExp() async {
+    final url = expUrl();
+    if (url == null) {
+      expError = 'FEED_URL was not set when the app was built.';
+      return;
+    }
+    try {
+      final r = await http.get(Uri.parse('$url?t=${DateTime.now().millisecondsSinceEpoch}')).timeout(const Duration(seconds: 30));
+      if (r.statusCode == 404) {
+        throw 'No experiment data yet. Add experiments.py and .github/workflows/experiments.yml to your repo, then open GitHub > Actions > '
+            '"Experiment lab" > Run workflow. Results appear here about 3 minutes later.';
+      }
+      if (r.statusCode != 200) throw 'Could not load experiment results (HTTP ${r.statusCode}).';
+      expData = jsonDecode(r.body) as Map<String, dynamic>;
+      expAt = DateTime.now();
+      expError = null;
+    } catch (e) {
+      expError = '$e';
+    }
+    if (mounted) setState(() {});
+  }
+
+  Widget botFocusCard() {
+    if (botRec.isEmpty) return const SizedBox.shrink();
+    final a = botFocusAcc, td = botFocusToday;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('Bot focus account (runs on GitHub 24/7, phone can be off)', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+          const Text('Bot paper trades that were FOCUS at the moment they opened (same rule as the Signals tab). Nothing here needs the app open.',
+              style: TextStyle(fontSize: 11)),
+          const SizedBox(height: 6),
+          Text('Closed: ${a.n == 0 ? 'none yet' : a.text}', style: TextStyle(fontWeight: FontWeight.w600, color: a.sumR >= 0 ? Colors.green : Colors.red)),
+          Text('Closed today (UTC): ${td.n == 0 ? 'none' : td.text}', style: const TextStyle(fontSize: 12)),
+          Text('Open now: $botFocusOpen', style: const TextStyle(fontSize: 12)),
+          const SizedBox(height: 4),
+          for (final t in botFocusRecent.take(10))
+            Text('${t.side} ${t.sym}  ${t.strat} ${t.tf}  ${t.status == 'open' ? 'open' : '${(t.r ?? 0) >= 0 ? '+' : ''}${(t.r ?? 0).toStringAsFixed(2)}R'}  ${ago(t.opened.toIso8601String())}',
+                style: TextStyle(fontSize: 11, color: t.status == 'open' ? null : (t.r ?? 0) >= 0 ? Colors.green : Colors.red)),
+        ]),
+      ),
+    );
+  }
+
+  Widget expTab() {
+    final d = expData;
+    if (d == null) {
+      return RefreshIndicator(
+        onRefresh: loadExp,
+        child: ListView(physics: const AlwaysScrollableScrollPhysics(), padding: const EdgeInsets.all(16), children: [
+          const Text('Experiment lab', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
+          const SizedBox(height: 8),
+          Text(expError ?? 'Loading experiment results...'),
+        ]),
+      );
+    }
+    final rows = (d['rows'] as Map? ?? {}).cast<String, dynamic>();
+    final minN = (d['min_n'] as num?)?.toInt() ?? 50;
+    final o = expTarget == 1 ? 0 : 5;                 // row: n, win, R, pf, older R, newer R (1:1), then the same for 1:2
+    List<num> v(String k) => (rows[k] as List).cast<num>();
+    bool proven(List<num> a) => a[0] >= minN && a[3 + o] > 1.1 && a[4 + o] > 0 && a[5 + o] > 0;
+    bool losing(List<num> a) => a[0] >= minN && a[4 + o] < 0 && a[5 + o] < 0;
+    String label(String k) {
+      final p = k.split('|');
+      switch (p[0]) {
+        case 'i': return '${p[1]} ${p[3]} (${p[2]})';
+        case 'ic': return '${p[1]} ${p[2]} on ${p[3]}';
+        default: return p.length >= 3 ? '${p[1]} ${p[2]}' : k;
+      }
+    }
+    final keys = rows.keys.where((k) {
+      if (!k.startsWith('$expView|')) return false;
+      final a = v(k);
+      if (a[0] < expMinN) return false;
+      if (expProvenOnly && !proven(a)) return false;
+      if (expTf != 'All' && (expView == 'i' || expView == 't') && k.split('|')[expView == 'i' ? 2 : 1] != expTf) return false;
+      return true;
+    }).toList()
+      ..sort((x, y) => expWorst ? v(x)[2 + o].compareTo(v(y)[2 + o]) : v(y)[2 + o].compareTo(v(x)[2 + o]));
+    final all = rows['all'] == null ? null : v('all');
+    final provenN = rows.keys.where((k) => k.startsWith('$expView|') && proven(v(k))).length;
+    Color rc(num x) => x >= 0 ? Colors.green : Colors.red;
+    String sg(num x) => '${x >= 0 ? '+' : ''}${x.toStringAsFixed(1)}';
+    final tfs = ((d['tfs'] as List?) ?? const []).map((e) => '$e').toList();
+    return RefreshIndicator(
+      onRefresh: loadExp,
+      child: ListView(physics: const AlwaysScrollableScrollPhysics(), padding: const EdgeInsets.all(12), children: [
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(12),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const Text('Experiment lab (runs on GitHub every 10 minutes, phone can be off)', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+              Text('Updated ${ago('${d['updated']}')}. ${(d['coins'] as List?)?.length ?? 0} coins x ${tfs.join(', ')}. '
+                  'Open trades ${d['open']}, closed ${d['closed']}${(d['days'] as List?)?.length == 2 ? ', ${(d['days'] as List)[0]} to ${(d['days'] as List)[1]}' : ''}.',
+                  style: const TextStyle(fontSize: 12)),
+              if (all != null)
+                Text('All experiments at 1:${expTarget}: ${all[0]} trades, ${all[1 + o]}% wins, ${sg(all[2 + o])}R, PF ${all[3 + o]}',
+                    style: TextStyle(fontWeight: FontWeight.w600, color: rc(all[2 + o]))),
+              const SizedBox(height: 4),
+              Text('Every indicator opens a virtual trade on each new signal, on every coin and timeframe, entering at the next candle. '
+                  'Each trade is followed to a 1:1 and a 1:2 target (stop 1.5 ATR, 0.05R fee). PROVEN = $minN+ trades, profit factor above 1.1 '
+                  'and profit in both the older and the newer half. Many trades happen at the same moment on different coins, so only trust PROVEN rows.',
+                  style: const TextStyle(fontSize: 11)),
+            ]),
+          ),
+        ),
+        Wrap(spacing: 6, children: [
+          for (final e in const {'Indicators': 'I', 'Indicator + timeframe': 'i', 'Coins': 'c', 'Indicator + coin': 'ic', 'Timeframes': 't'}.entries)
+            ChoiceChip(label: Text(e.key), selected: expView == e.value, onSelected: (_) => setState(() => expView = e.value)),
+        ]),
+        Wrap(spacing: 6, children: [
+          for (final t in const [1, 2]) ChoiceChip(label: Text('Target 1:$t'), selected: expTarget == t, onSelected: (_) => setState(() => expTarget = t)),
+          ChoiceChip(label: const Text('Best first'), selected: !expWorst, onSelected: (_) => setState(() => expWorst = false)),
+          ChoiceChip(label: const Text('Worst first'), selected: expWorst, onSelected: (_) => setState(() => expWorst = true)),
+          FilterChip(label: Text('Proven only ($provenN)'), selected: expProvenOnly, onSelected: (x) => setState(() => expProvenOnly = x)),
+        ]),
+        Wrap(spacing: 6, children: [
+          for (final n in const [1, 20, 50, 100]) ChoiceChip(label: Text('$n+ trades'), selected: expMinN == n, onSelected: (_) => setState(() => expMinN = n)),
+        ]),
+        if (expView == 'i' || expView == 't')
+          Wrap(spacing: 6, children: [
+            for (final t in ['All', ...tfs]) ChoiceChip(label: Text(t), selected: expTf == t, onSelected: (_) => setState(() => expTf = t)),
+          ]),
+        if (expError != null) Text(expError!, style: const TextStyle(fontSize: 11, color: Colors.orange)),
+        if (keys.isEmpty) const Padding(padding: EdgeInsets.all(16), child: Text('Nothing matches yet. Lower the trade minimum or wait for more data.')),
+        for (final k in keys.take(60))
+          Builder(builder: (_) {
+            final a = v(k);
+            final pv = proven(a), ls = losing(a);
+            return ListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              title: Text(label(k), style: const TextStyle(fontWeight: FontWeight.w600)),
+              subtitle: Text('${a[0]} trades, ${a[1 + o]}% wins, PF ${a[3 + o]}, halves ${sg(a[4 + o])} / ${sg(a[5 + o])}'
+                  '${pv ? '  PROVEN' : ls ? '  LOSING' : ''}',
+                  style: TextStyle(fontSize: 12, color: pv ? Colors.green : ls ? Colors.red : null)),
+              trailing: Text('${sg(a[2 + o])}R', style: TextStyle(fontWeight: FontWeight.w700, color: rc(a[2 + o]))),
+            );
+          }),
+        if (keys.length > 60) Text('Showing 60 of ${keys.length}.', style: const TextStyle(fontSize: 11)),
+      ]),
+    );
+  }
+
+  BotRec? recOf(Map<String, dynamic> s) => botRec['${s['strategy']}|${s['side']}'];
+  bool isFocus(Map<String, dynamic> s) => botRecFocus(recOf(s));
+
+  /// Opens app paper trades from fresh bot signals that pass the focus rule, with the bot's own stop and target.
+  Future<void> followBotSignals() async {
+    if (!autoPaper || !paperLoaded || paperSource == 0 || botFollowBusy || data == null || botRec.isEmpty) return;
+    final sigs = (data!['signals'] as List? ?? []).cast<Map<String, dynamic>>();
+    String key(Map<String, dynamic> s) => '${s['symbol']}|${s['strategy']}|${s['tf']}|${s['side']}|${s['time']}';
+    final fresh = sigs.where((s) => !botSeen.contains(key(s))).toList();
+    if (fresh.isEmpty) return;
+    botFollowBusy = true;
+    var opened = 0, notFocus = 0, stale = 0, notCoin = 0, busy = 0, moved = 0;
+    try {
+      for (final s in fresh.reversed) {                 // oldest first
+        botSeen.add(key(s));
+        final t0 = DateTime.tryParse('${s['time']}');
+        if (t0 == null || DateTime.now().toUtc().difference(t0.toUtc()).inMinutes > 30) { stale++; continue; }
+        final side = s['side'] == 'BUY' ? 1 : -1;
+        final rec = recOf(s);
+        if (!botRecFocus(rec)) {
+          notFocus++;
+          gateRejects.insert(0, GateReject(DateTime.now(), '${s['symbol']}', '${s['tf']}', side,
+              'Bot signal not focus: ${s['strategy']} ${s['side']} ${rec == null ? 'has no record yet' : rec.text}'));
+          if (gateRejects.length > 60) gateRejects.removeLast();
+          continue;
+        }
+        final coin = botCoin('${s['symbol']}');
+        if (coin == null) { notCoin++; continue; }
+        if (trades.any((t) => t.isOpen && t.coin == coin)) { busy++; continue; }
+        if (trades.where((t) => t.isOpen && (t.source == 'auto' || t.source == 'MR' || t.source == 'BOT')).length >= paperMaxOpen) { busy++; continue; }
+        final sl = (s['sl'] as num?)?.toDouble(), tp = (s['tp'] as num?)?.toDouble(), e0 = (s['entry'] as num?)?.toDouble();
+        if (sl == null || tp == null || e0 == null) continue;
+        final px = await fetchPrice(coin);
+        if (px == null) { notCoin++; continue; }
+        final risk0 = (e0 - sl).abs();
+        // still between stop and target, and not more than 0.3R past the bot's entry (no chasing)
+        if ((px - sl) * side <= 0 || (tp - px) * side <= 0 || risk0 <= 0 || (px - e0) * side > 0.3 * risk0) { moved++; continue; }
+        final stopDist = (px - sl).abs();
+        final riskUsd = paperAmount > 0 ? paperAmount * stopDist / px : paperEquity * paperRisk;
+        final id = trades.isEmpty ? 1 : trades.map((t) => t.id).reduce(math.max) + 1;
+        final tf = paperHoldHours.containsKey('${s['tf']}') ? '${s['tf']}' : '1h';
+        final t = AppTrade(
+          id: id, coin: coin, tf: tf, source: 'BOT', verdict: '${s['strategy']}', side: side, buys: 0, sells: 0, neutrals: 0,
+          mood: 0, entry: px, sl: sl, tp: tp, score: 0, riskCash: riskUsd, amount: paperAmount > 0 ? paperAmount : 0,
+          adx: null, atrPct: null, opened: DateTime.now(), regime: 'Bot focus', inds: '${s['strategy']} ${s['side']}',
+        );
+        trades.add(t);
+        opened++;
+        notifyPaper(t.id, 'Bot focus trade opened: $coin ${s['side']} ($tf)',
+            '${s['strategy']}. Entry ${fmtPrice(px)}  SL ${fmtPrice(sl)}  TP ${fmtPrice(tp)}. Record: ${rec!.text}');
+      }
+      await savePaper();   // also saves the handled-signal list
+      final parts = <String>[
+        if (notFocus > 0) '$notFocus not focus',
+        if (stale > 0) '$stale older than 30 min',
+        if (notCoin > 0) '$notCoin not a Binance coin',
+        if (busy > 0) '$busy coin already open / max open',
+        if (moved > 0) '$moved price already moved',
+      ];
+      botStatus = 'Bot focus ${hhmm(DateTime.now())}: ${fresh.length} new signals, $opened opened.${parts.isEmpty ? '' : ' Skipped: ${parts.join(', ')}.'}';
+    } catch (e) {
+      botStatus = 'Bot focus could not run: $e';
+    } finally {
+      botFollowBusy = false;
+      if (mounted) setState(() {});
+    }
+  }
 
   Map<String, Edge> get focusMap {
     final k = trades.where((t) => !t.isOpen).length;
@@ -2216,6 +2602,7 @@ class _HomeState extends State<Home> {
     if (source != 'manual') {
       final why = focusBlock(coin, a.side, indsNow);
       if (why != null) {
+        focusSkipped++;
         paperRejected++;
         gateRejects.insert(0, GateReject(DateTime.now(), coin, tf, a.side, why));
         if (gateRejects.length > 60) gateRejects.removeLast();
@@ -2374,7 +2761,7 @@ class _HomeState extends State<Home> {
 
   /// Runs every minute. For each chosen timeframe whose candle just closed, checks the top coins once and opens paper trades.
   Future<void> paperScanCycle() async {
-    if (!autoPaper || paperScanBusy || !paperLoaded) return;
+    if (!autoPaper || paperScanBusy || !paperLoaded || paperSource == 1) return;   // 1 = bot focus signals only
     paperScanBusy = true;
     try {
       if (futSymbols.isEmpty) await loadFutures();
@@ -2385,6 +2772,11 @@ class _HomeState extends State<Home> {
         paperCoinsAt = DateTime.now();
       }
       final coins = paperCoinList.take(paperCoins).toList();
+      if (coins.isEmpty) {
+        paperStatus = 'No coins to check: the Binance futures coin list did not load${futuresError == null ? '' : ' ($futuresError)'}. Retrying every minute.';
+        paperCoinsAt = DateTime(2000);
+        return;
+      }
       final nowMs = DateTime.now().millisecondsSinceEpoch;
       final jobs = <List<String>>[];
       for (final tf in mtfList) {
@@ -2396,7 +2788,13 @@ class _HomeState extends State<Home> {
           if (paperLogged['$c|$tf'] != t0) jobs.add([c, tf, '$t0']);
         }
       }
-      if (jobs.isEmpty) return;
+      if (jobs.isEmpty) {
+        if (!paperStatus.startsWith('Last check')) {
+          final tfs = mtfList.where(paperTfs.contains).toList();
+          paperStatus = tfs.isEmpty ? 'No timeframe is selected for auto trading.' : 'Waiting for the next candle close on ${tfs.join(', ')}.';
+        }
+        return;
+      }
       if (mounted) setState(() => paperStatus = 'Checking ${jobs.length} coin/timeframe pairs...');
       final cands = <Map<String, dynamic>>[];
       for (var i = 0; i < jobs.length; i += 8) {
@@ -2420,26 +2818,29 @@ class _HomeState extends State<Home> {
         await Future.delayed(const Duration(milliseconds: 250));      // stay well inside the exchange rate limit
       }
       cands.sort((a, b) => (b['ac'] as Analysis).score.abs().compareTo((a['ac'] as Analysis).score.abs()));
-      var opened = 0, rejected = 0, qchecked = 0;
+      var opened = 0, rejected = 0, qchecked = 0, sOpen = 0, sCool = 0, sNews = 0, sMax = 0, sPlan = 0;
+      final focus0 = focusSkipped;
+      final weak = jobs.length - cands.length;
       paperSignals += cands.length;
       for (final m in cands) {
-        if (trades.where((t) => t.isOpen && (t.source == 'auto' || t.source == 'MR')).length >= paperMaxOpen) break;   // manual trades do not use up the auto limit
+        if (trades.where((t) => t.isOpen && (t.source == 'auto' || t.source == 'MR' || t.source == 'BOT')).length >= paperMaxOpen) { sMax = cands.length; break; }   // manual trades do not use up the auto limit
         final coin = m['coin'] as String, tf = m['tf'] as String;
         final ac = m['ac'] as Analysis;
         final cs = m['cs'] as List<Candle>;
         final isTrend = m['trend'] == true;
         final mrSig = m['mr'] as MrSignal?;
-        if (trades.any((t) => t.isOpen && t.coin == coin)) continue; // avoid duplicate exposure across timeframes
-        if (eventSoon(coin) != null) continue;                         // same news blackout as the Final call
+        if (trades.any((t) => t.isOpen && t.coin == coin)) { sOpen++; continue; } // avoid duplicate exposure across timeframes
+        if (eventSoon(coin) != null) { sNews++; continue; }                         // same news blackout as the Final call
         final holdH = paperHoldHours[tf] ?? 48;
         final cooldown = trades.any((t) => !t.isOpen && t.coin == coin && t.tf == tf && t.closed != null &&
             DateTime.now().difference(t.closed!).inMinutes < holdH * 15);   // wait a quarter of the hold time after a close
-        if (cooldown) continue;
+        if (cooldown) { sCool++; continue; }
         if (!isTrend) {
           // mean-reversion BUY: same news blackout, cooldown, one-trade-per-coin and 1:1 plan as the trend trades, its own label
           if (mrSig == null) continue;
           final mrAnalysis = Analysis(ac.ma, ac.osc, ac.info, ac.buys, ac.sells, ac.neutrals, cs.last.open, ac.atr, ac.adx, mrSig.side * 0.5, ac.sup, ac.res);
           final nm = openPaperTrade(coin, tf, mrAnalysis, 'MR', {'inds': mrSig.inds, 'regime': 'Mean reversion'});
+          if (nm == null) sPlan++;
           if (nm != null) {
             opened++;
             notifyPaper(nm.id, 'Mean-reversion trade opened: ${nm.coin} ${nm.side > 0 ? 'BUY' : 'SELL'} ($tf)',
@@ -2467,6 +2868,7 @@ class _HomeState extends State<Home> {
           }
         }
         final nt = openPaperTrade(coin, tf, entryAnalysis, 'auto', q);
+        if (nt == null) sPlan++;
         if (nt != null) {
           opened++;
           notifyPaper(nt.id, 'Paper trade opened: ${nt.coin} ${nt.side > 0 ? 'BUY' : 'SELL'} ($tf)',
@@ -2474,7 +2876,19 @@ class _HomeState extends State<Home> {
         }
       }
       if (opened > 0) await savePaper();
-      paperStatus = 'Last check ${hhmm(DateTime.now())}: ${jobs.length} pairs, ${cands.length} signals, $opened opened, $rejected filtered out.';
+      final sFocus = focusSkipped - focus0;
+      final parts = <String>[
+        if (weak > 0) '$weak no signal / weak score or ADX',
+        if (rejected > 0) '$rejected failed the quality gate',
+        if (sOpen > 0) '$sOpen coin already has an open trade',
+        if (sCool > 0) '$sCool cooldown after a close',
+        if (sNews > 0) '$sNews news blackout',
+        if (sFocus > 0) '$sFocus Focus filter',
+        if (sPlan - sFocus > 0) '${sPlan - sFocus} stop/target not valid',
+        if (sMax > 0) 'max open trades ($paperMaxOpen) reached',
+      ];
+      paperStatus = 'Last check ${hhmm(DateTime.now())}: ${jobs.length} pairs checked, $opened opened.'
+          '${parts.isEmpty ? '' : ' Skipped: ${parts.join(', ')}.'}';
     } catch (e) {
       paperStatus = 'Auto paper trading could not run: $e';
     } finally {
@@ -3653,9 +4067,38 @@ class _HomeState extends State<Home> {
     }
     final all = (data!['signals'] as List? ?? []).cast<Map<String, dynamic>>();
     final list = all
-        .where((s) => (filter == 'All' || s['side'] == filter) && (tfFilter == 'All' || s['tf'] == tfFilter))
+        .where((s) => (filter == 'All' || s['side'] == filter) && (tfFilter == 'All' || s['tf'] == tfFilter) &&
+            (!sigFocusOnly || botRec.isEmpty || isFocus(s)))
         .toList();
+    final focusKeys = botRec.entries.where((e) => !e.key.contains(':') && e.key != 'all' && botRecFocus(e.value)).toList()
+      ..sort((a, b) => b.value.sumR.compareTo(a.value.sumR));
+    final allRec = botRec['all'];
     return wrap([
+      Card(
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('Focus signals', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+            Text(botRec.isEmpty
+                ? (botRecError ?? 'Loading the bot track record...')
+                : 'A signal is FOCUS when its strategy + direction already has $botFocusMinN+ closed bot paper trades with a net profit. '
+                  'Bot record: ${allRec?.text ?? '-'}. Updated ${botRecAt == null ? '-' : hhmm(botRecAt!)}.',
+                style: const TextStyle(fontSize: 12)),
+            const SizedBox(height: 4),
+            const Text('Tested on 2,201 past bot trades, using only data known at the time: all signals -70.8R, focus signals +81.4R '
+                '(profit factor 1.21). Uses the bot\'s own stop and target. Past paper results, not a guarantee.', style: TextStyle(fontSize: 11)),
+            const SizedBox(height: 6),
+            if (focusKeys.isNotEmpty) const Text('Focus right now:', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+            for (final e in focusKeys.take(8))
+              Text('${e.key.replaceAll('|', ' ')}: ${e.value.text}', style: const TextStyle(fontSize: 12, color: Colors.green)),
+            Row(children: [
+              const Expanded(child: Text('Show only focus signals', style: TextStyle(fontSize: 13))),
+              Switch(value: sigFocusOnly, onChanged: (v) { setState(() => sigFocusOnly = v); savePaper(); }),
+            ]),
+          ]),
+        ),
+      ),
+      botFocusCard(),
       Wrap(
         spacing: 8,
         children: [
@@ -3679,7 +4122,7 @@ class _HomeState extends State<Home> {
         ],
       ),
       if (error != null) message(error!),
-      if (list.isEmpty) message('No signals yet. The bot posts here when a setup appears.'),
+      if (list.isEmpty) message(sigFocusOnly && all.isNotEmpty ? 'No focus signal right now. Switch off "Show only focus signals" to see all ${all.length}.' : 'No signals yet. The bot posts here when a setup appears.'),
       for (final s in list) signalCard(s),
     ]);
   }
@@ -3710,6 +4153,19 @@ class _HomeState extends State<Home> {
             const SizedBox(height: 4),
             Text('${s['strategy']} (${s['tf']}) - ${s['style']}${s['grade'] == 'experimental' ? '  [experimental]' : ''}',
                 style: const TextStyle(fontWeight: FontWeight.w500)),
+            if (botRec.isNotEmpty)
+              Builder(builder: (_) {
+                final rec = recOf(s), coinRec = botRec['sym:${s['symbol']}|${s['side']}'];
+                final f = botRecFocus(rec);
+                return Padding(
+                  padding: const EdgeInsets.only(top: 4),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Text('${f ? 'FOCUS' : 'Not focus'}: ${s['strategy']} ${s['side']} ${rec == null ? 'has no closed trades yet' : rec.text}',
+                        style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: f ? Colors.green : Colors.grey)),
+                    if (coinRec != null) Text('${s['symbol']} ${s['side']}: ${coinRec.text}', style: const TextStyle(fontSize: 11)),
+                  ]),
+                );
+              }),
             const SizedBox(height: 6),
             Text('Entry ${fmt(s['entry'])}   SL ${fmt(s['sl'])}   TP ${fmt(s['tp'])}'),
             const SizedBox(height: 4),
@@ -4152,8 +4608,10 @@ class _HomeState extends State<Home> {
           ]),
           Text(focusMode == 0 ? 'Off: all signals that pass the gate are traded, so every combo keeps collecting data.'
               : focusMode == 1 ? 'Skip losers: no new auto trades on a coin + direction that lost in both halves, or when most agreeing indicators did worse than average.'
-              : 'Proven only: auto trades only on proven coin + direction combos. Very few trades until combos reach $focusMinN trades.',
-              style: const TextStyle(fontSize: 11)),
+              : proven.isEmpty
+                  ? 'Proven only: no coin + direction is proven yet, so NO auto trades will open. Use Off or Skip losers.'
+                  : 'Proven only: auto trades only on the ${proven.length} proven coin + direction combos below.',
+              style: TextStyle(fontSize: 11, color: focusMode == 2 && proven.isEmpty ? Colors.red : null, fontWeight: focusMode == 2 && proven.isEmpty ? FontWeight.w700 : null)),
           sect('Direction overall', sides),
           sect('Proven profitable coins + direction', proven),
           sect('Coins + direction losing in both halves', losing),
@@ -4198,6 +4656,7 @@ class _HomeState extends State<Home> {
       return m;
     }
     return ListView(physics: const AlwaysScrollableScrollPhysics(), padding: const EdgeInsets.all(12), children: [
+      botFocusCard(),
       Card(
         child: Padding(
           padding: const EdgeInsets.all(14),
@@ -4206,6 +4665,18 @@ class _HomeState extends State<Home> {
               const Expanded(child: Text('Auto paper trading', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16))),
               Switch(value: autoPaper, onChanged: setAutoPaper),
             ]),
+            const Text('Trade source', style: TextStyle(fontSize: 12)),
+            Wrap(spacing: 8, children: [
+              for (final o in const {'Bot focus signals': 1, 'App indicators': 0, 'Both': 2}.entries)
+                ChoiceChip(label: Text(o.key), selected: paperSource == o.value, onSelected: (_) { setState(() => paperSource = o.value); savePaper(); }),
+            ]),
+            Text(paperSource == 0
+                ? 'App indicators: the app\'s own signals. Your uploaded app trades lost (426 trades, -37.6R) and no coin or direction filter fixed it.'
+                : 'Bot focus: copies fresh GitHub bot signals (30 min or newer) whose strategy + direction is profitable in the bot\'s own record. '
+                  'Uses the bot\'s stop and target (mostly 1:2): at 1:1 the same signals were about break-even. Crypto only.',
+                style: const TextStyle(fontSize: 11)),
+            if (paperSource != 0 && botStatus.isNotEmpty) Text(botStatus, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600)),
+            if (paperSource != 0 && botRecError != null) Text(botRecError!, style: const TextStyle(fontSize: 11, color: Colors.orange)),
             if (autoPaper && (paperMinQ == 0 || paperMinAdx == 0 || paperMinScore < 0.35))
               Container(
                 margin: const EdgeInsets.only(top: 6, bottom: 4),
@@ -4223,7 +4694,7 @@ class _HomeState extends State<Home> {
               onChanged: (v) { setState(() => paperMr = v); savePaper(); },
             ),
             Text(autoPaper
-                ? 'ON. When a candle closes on any chosen timeframe, the app checks the top $paperCoins coins and opens virtual trades from the signals that pass your filters. Keep the app open.'
+                ? 'ON. When a candle closes on any chosen timeframe, the app checks the top $paperCoins coins and opens virtual trades from the signals that pass your filters. Works while the app is open or minimized. Swiping it away from recent apps stops in-app trading (Android rule); the Bot focus account and the Experiments tab run on GitHub and never stop.'
                 : 'OFF. Turn on to let the app open virtual trades on the top $paperCoins coins across the timeframes you choose, and track whether they hit target or stop.',
                 style: const TextStyle(fontSize: 12)),
             if (paperStatus.isNotEmpty) Text(paperStatus, style: const TextStyle(fontSize: 11)),
@@ -4350,7 +4821,7 @@ class _HomeState extends State<Home> {
         ),
       if (open.isNotEmpty) liveBoard(open),
       if (st.n > 0) ...[
-        group('By strategy', by((t) => t.source == 'auto' ? 'Trend (auto)' : t.source == 'MR' ? 'Mean reversion (MR)' : 'Manual')),
+        group('By strategy', by(stratLabel)),
         group('By target (reward:risk)', by((t) => '1:${fmtRR(t.plannedRR)}')),
         group('By timeframe', by((t) => t.tf)),
         group('By trading style', by((t) => styleOf(t.tf))),
@@ -4535,7 +5006,7 @@ class _HomeState extends State<Home> {
   @override
   Widget build(BuildContext context) {
     return DefaultTabController(
-      length: 9,
+      length: 10,
       child: Scaffold(
         appBar: AppBar(
           title: const Text('Signal Bot'),
@@ -4558,6 +5029,7 @@ class _HomeState extends State<Home> {
             Tab(text: 'Paper'),
             Tab(text: 'Lab'),
             Tab(text: 'Report'),
+            Tab(text: 'Experiments'),
           ]),
         ),
         body: Column(
@@ -4568,7 +5040,7 @@ class _HomeState extends State<Home> {
                 child: Text('Updated ${ago(data!['updated'])}', style: const TextStyle(fontSize: 12)),
               ),
             Expanded(
-              child: TabBarView(children: [marketTab(), scannerTab(), signalsTab(), newsTab(), alertsTab(), accountTab(), paperTab(), labTab(), reportTab()]),
+              child: TabBarView(children: [marketTab(), scannerTab(), signalsTab(), newsTab(), alertsTab(), accountTab(), paperTab(), labTab(), reportTab(), expTab()]),
             ),
             const Padding(
               padding: EdgeInsets.all(6),
