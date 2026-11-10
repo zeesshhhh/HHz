@@ -1687,8 +1687,12 @@ const labRaceAtr = 1.5;         // target and stop distance for the race test, i
 const labFee = 0.05;            // same paper fee as everywhere else, in R
 /// The only indicators the Lab records (your choice, Nov 10: 7 first, then RSI (14), Z-score (20) and Ultimate Oscillator). Everything else was removed from the Lab.
 /// The Experiments tab (GitHub) still tests 40 indicators, so they can be compared there.
-const labKeep = ['RSI (2)', 'RSI (14)', 'CCI (20)', 'Stochastic (14,3)', 'Stochastic RSI', 'MFI (14)', 'Bollinger %B (20,2)', 'Z-score (20)',
+const labBase = ['RSI (2)', 'RSI (14)', 'CCI (20)', 'Stochastic (14,3)', 'Stochastic RSI', 'MFI (14)', 'Bollinger %B (20,2)', 'Z-score (20)',
   'Ultimate Oscillator', 'Candle pattern'];
+/// Each Lab indicator also has a "+ trend" version (Nov 10): BUY only while price is above EMA 200 of the same timeframe,
+/// SELL only while it is below. The first day showed these signals winning on SELL and losing on BUY in a falling market.
+const labTrendSuffix = ' + trend';
+final labKeep = <String>[...labBase, for (final n in labBase) '$n$labTrendSuffix'];
 
 /// One Lab signal seen as a trade: entry at the signal candle's close, target and stop 1.5 ATR (1:1), judged over 6 candles.
 class LabTrade {
@@ -1966,6 +1970,7 @@ class _HomeState extends State<Home> {
   int labCoins = 20, labScored = 0;
   String labStyle = 'All', labCat = 'All', labStatus = '', labSide = 'All';
   String? labSel;          // indicator whose trades are shown
+  String labVersion = 'All';   // All / Plain / With trend
   int labShown = 50;
   DateTime? labUpdated;
   Timer? labTimer, uiTimer;
@@ -2224,8 +2229,15 @@ class _HomeState extends State<Home> {
             final a = analyze(closed, 2);
             if (a.atr.isNaN || a.atr <= 0) return null;
             final votes = <String, int>{};
+            var trend = 0;                                   // +1 price above EMA 200, -1 below, 0 not enough candles
+            for (final r in a.ma) {
+              if (r.name == 'EMA 200') trend = r.sig;
+            }
             for (final r in [...a.ma, ...a.osc]) {
-              if (r.sig != 0 && labKeep.contains(r.name)) votes[r.name] = r.sig;
+              if (r.sig != 0 && labBase.contains(r.name)) {
+                votes[r.name] = r.sig;
+                if (trend == r.sig) votes['${r.name}$labTrendSuffix'] = r.sig;
+              }
             }
             return LabSnap(j[0], j[1], t0, closed.last.close, a.atr, votes)..move = t0.millisecondsSinceEpoch.toDouble();
           } catch (_) {
@@ -2645,7 +2657,7 @@ class _HomeState extends State<Home> {
     final fresh = sigs.where((s) => !botSeen.contains(key(s))).toList();
     if (fresh.isEmpty) return;
     botFollowBusy = true;
-    var opened = 0, notFocus = 0, stale = 0, notCoin = 0, busy = 0, moved = 0;
+    var opened = 0, notFocus = 0, stale = 0, notCoin = 0, busy = 0, moved = 0, bad = 0;
     try {
       for (final s in fresh.reversed) {                 // oldest first
         botSeen.add(key(s));
@@ -2669,6 +2681,8 @@ class _HomeState extends State<Home> {
         final px = await fetchPrice(coin);
         if (px == null) { notCoin++; continue; }
         final risk0 = (e0 - sl).abs();
+        // broken plan from the bot (seen: AKE 4h with the stop 79% away and the target below zero)
+        if (tp <= 0 || sl <= 0 || risk0 / e0 > 0.20) { bad++; continue; }
         // still between stop and target, and not more than 0.3R past the bot's entry (no chasing)
         if ((px - sl) * side <= 0 || (tp - px) * side <= 0 || risk0 <= 0 || (px - e0) * side > 0.3 * risk0) { moved++; continue; }
         final stopDist = (px - sl).abs();
@@ -2692,6 +2706,7 @@ class _HomeState extends State<Home> {
         if (notCoin > 0) '$notCoin not a Binance coin',
         if (busy > 0) '$busy coin already open / max open',
         if (moved > 0) '$moved price already moved',
+        if (bad > 0) '$bad broken stop/target (stop over 20% away or target below 0)',
       ];
       botStatus = 'Bot focus ${hhmm(DateTime.now())}: ${fresh.length} new signals, $opened opened.${parts.isEmpty ? '' : ' Skipped: ${parts.join(', ')}.'}';
     } catch (e) {
@@ -5284,7 +5299,8 @@ class _HomeState extends State<Home> {
       if (!inStyle(x)) continue;
       x.votes.forEach((n, sd) { if (inSide(sd)) stats[n]?.add(LabTrade(x, sd, true)); });
     }
-    final order = [...labKeep]..sort((p, q) => stats[q]!.r.compareTo(stats[p]!.r));
+    final order = labKeep.where((n) => labVersion == 'All' || (labVersion == 'With trend') == n.endsWith(labTrendSuffix)).toList()
+      ..sort((p, q) => stats[q]!.r.compareTo(stats[p]!.r));
     Color rc(double v) => v >= 0 ? Colors.green : Colors.red;
     String sg(double v) => '${v >= 0 ? '+' : ''}${v.toStringAsFixed(2)}';
     String when(DateTime t) => '${t.day.toString().padLeft(2, '0')}/${t.month.toString().padLeft(2, '0')} ${hhmm(t)}';
@@ -5314,10 +5330,11 @@ class _HomeState extends State<Home> {
           padding: const EdgeInsets.all(14),
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
             Row(children: [
-              Expanded(child: Text('Signal Lab (${labKeep.length} indicators)', style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16))),
+              Expanded(child: Text('Signal Lab (${labBase.length} indicators + trend versions)', style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16))),
               Switch(value: labOn, onChanged: setLabOn),
             ]),
-            Text('Tests only: ${labKeep.join(', ')}. Every signal is a trade: entry at the signal candle\'s close, target 1.5 ATR, '
+            Text('Tests only: ${labBase.join(', ')}. Each also has a "+ trend" version that keeps only BUY signals while price is above '
+                'EMA 200 and SELL signals while it is below (same timeframe). Every signal is a trade: entry at the signal candle\'s close, target 1.5 ATR, '
                 'stop 1.5 ATR (1:1), judged over the next $labHorizonBars candles, 0.05R fee. Timed out = neither hit, closed at the last price. '
                 'An indicator that stays in its zone for several candles gives a signal on each of them.', style: const TextStyle(fontSize: 12)),
             const SizedBox(height: 6),
@@ -5334,6 +5351,7 @@ class _HomeState extends State<Home> {
       ),
       Wrap(spacing: 8, children: [for (final x in styles) ChoiceChip(label: Text(x), selected: labStyle == x, onSelected: (_) => setState(() { labStyle = x; labShown = 50; }))]),
       Wrap(spacing: 8, children: [for (final x in const ['All', 'BUY', 'SELL']) ChoiceChip(label: Text(x), selected: labSide == x, onSelected: (_) => setState(() { labSide = x; labShown = 50; }))]),
+      Wrap(spacing: 8, children: [for (final x in const ['All', 'Plain', 'With trend']) ChoiceChip(label: Text(x), selected: labVersion == x, onSelected: (_) => setState(() => labVersion = x))]),
       const Padding(padding: EdgeInsets.fromLTRB(4, 10, 4, 2), child: Text('Indicators (tap one to see all its trades)', style: TextStyle(fontWeight: FontWeight.w600))),
       for (final n in order)
         Card(
