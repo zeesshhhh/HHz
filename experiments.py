@@ -290,6 +290,14 @@ def heikin(o, h, l, c):
     return hc - ho
 
 
+# Mean-reversion signals that also get a "+ trend" version: BUY only while price is above EMA 200 of the same
+# timeframe, SELL only while it is below (buy dips in an uptrend, sell rallies in a downtrend). Added Nov 10 after
+# the first day showed these signals winning on SELL and losing on BUY in a falling market.
+TREND_FILTERED = ["RSI 2 10/90 reversal", "RSI 14 30/70 reversal", "CCI 20 reversal", "Stochastic 14,3 cross in zone",
+                  "Williams %R reversal", "MFI 14 reversal", "Z-score 20 reversal", "Ultimate oscillator reversal"]
+TREND_SUFFIX = " + trend"
+
+
 def indicators(df):
     """name -> array of +1 (new BUY signal), -1 (new SELL signal) or 0, one value per candle."""
     o, h, l, c, v = (df[k].values for k in ("open", "high", "low", "close", "volume"))
@@ -349,7 +357,7 @@ def indicators(df):
     squeeze = (bu < ku) & (bl > kl)
     release = np.r_[False, squeeze[:-1]] & ~squeeze
     vol_surge = (v > 2 * sma(v, 20)) & (np.abs(body) > 0.5 * (h - l))
-    return {
+    out = {
         "EMA 9/21 cross": flip(e9 - e21),
         "EMA 20/50 cross": flip(e20 - e50),
         "EMA 50/200 cross": flip(e50 - e200),
@@ -390,7 +398,12 @@ def indicators(df):
         "Ultimate oscillator reversal": events(up(uo, 30), down(uo, 70)),
         "Squeeze release": np.where(release, np.sign(c - sma(c, 20)), 0),
         "Volume surge candle": np.where(vol_surge, np.sign(body), 0),
-    }, a14
+    }
+    above, below = c > e200, c < e200
+    for n in TREND_FILTERED:
+        a = out[n]
+        out[n + TREND_SUFFIX] = np.where(((a == 1) & above) | ((a == -1) & below), a, 0)
+    return out, a14
 
 
 # ---------------------------------------------------------------- trades
