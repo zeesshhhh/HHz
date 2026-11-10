@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io' show File;
+import 'dart:io' show File, ZLibCodec;
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -856,6 +856,73 @@ const symCurrencies = {
 
 List<String> keysFor(String sym) => coinKeys[sym] ?? [sym.length >= 4 ? sym.toLowerCase() : ' ${sym.toLowerCase()} '];
 
+/// Coins a headline can be traded on (curated names, so 'near', 'link' or 'trump' in normal English do not trigger trades).
+const newsCoinKeys = {
+  'BTC': ['bitcoin', ' btc'], 'ETH': ['ethereum', ' eth '], 'SOL': ['solana'], 'BNB': [' bnb', 'binance coin'], 'XRP': [' xrp', 'ripple'],
+  'DOGE': ['dogecoin', ' doge'], 'ADA': ['cardano'], 'AVAX': ['avalanche'], 'LINK': ['chainlink'], 'DOT': ['polkadot'], 'LTC': ['litecoin'],
+  'TRX': [' tron '], 'TON': ['toncoin'], 'SUI': [' sui '], 'SHIB': ['shiba inu'], 'UNI': ['uniswap'], 'AAVE': [' aave'], 'ARB': ['arbitrum'],
+  'OP': ['optimism'], 'APT': ['aptos'], 'HYPE': ['hyperliquid'], 'ENA': ['ethena'], 'WLD': ['worldcoin'], 'BCH': ['bitcoin cash'],
+  'PEPE': [' pepe'], 'XLM': ['stellar'], 'HBAR': ['hedera'], 'NEAR': ['near protocol'], 'ATOM': ['cosmos'], 'FIL': ['filecoin'],
+};
+const newsStopAtr = 1.5;   // news trades: stop 1.5 ATR(14) of the trade's timeframe, target = your reward:risk setting
+
+double atrWilder(List<Candle> cs, [int n = 14]) {
+  if (cs.length <= n) return double.nan;
+  double? a;
+  for (var i = 1; i < cs.length; i++) {
+    final c = cs[i], pc = cs[i - 1].close;
+    final tr = math.max(c.high - c.low, math.max((c.high - pc).abs(), (c.low - pc).abs()));
+    a = a == null ? tr : (a * (n - 1) + tr) / n;
+  }
+  return a ?? double.nan;
+}
+
+final _crcTable = List<int>.generate(256, (n) {
+  var c = n;
+  for (var k = 0; k < 8; k++) {
+    c = (c & 1) != 0 ? 0xEDB88320 ^ (c >> 1) : c >> 1;
+  }
+  return c;
+});
+int crc32(List<int> data) {
+  var c = 0xFFFFFFFF;
+  for (final b in data) {
+    c = _crcTable[(c ^ b) & 0xFF] ^ (c >> 8);
+  }
+  return (c ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+}
+
+/// Minimal ZIP writer (deflate from dart:io), so all logs can be saved as one file without an extra package.
+Uint8List zipFiles(Map<String, String> files) {
+  final out = BytesBuilder();
+  final central = BytesBuilder();
+  final now = DateTime.now();
+  final dosTime = (now.hour << 11) | (now.minute << 5) | (now.second ~/ 2);
+  final dosDate = ((now.year - 1980) << 9) | (now.month << 5) | now.day;
+  var count = 0;
+  void u16(BytesBuilder b, int v) => b.add([v & 0xFF, (v >> 8) & 0xFF]);
+  void u32(BytesBuilder b, int v) => b.add([v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF]);
+  for (final e in files.entries) {
+    final name = utf8.encode(e.key);
+    final raw = utf8.encode(e.value);
+    final comp = ZLibCodec(raw: true, level: 6).encode(raw);
+    final crc = crc32(raw);
+    final offset = out.length;
+    u32(out, 0x04034b50); u16(out, 20); u16(out, 0x0800); u16(out, 8); u16(out, dosTime); u16(out, dosDate);
+    u32(out, crc); u32(out, comp.length); u32(out, raw.length); u16(out, name.length); u16(out, 0);
+    out.add(name); out.add(comp);
+    u32(central, 0x02014b50); u16(central, 20); u16(central, 20); u16(central, 0x0800); u16(central, 8); u16(central, dosTime); u16(central, dosDate);
+    u32(central, crc); u32(central, comp.length); u32(central, raw.length); u16(central, name.length); u16(central, 0); u16(central, 0);
+    u16(central, 0); u16(central, 0); u32(central, 0); u32(central, offset);
+    central.add(name);
+    count++;
+  }
+  final cdOffset = out.length, cd = central.takeBytes();
+  out.add(cd);
+  u32(out, 0x06054b50); u16(out, 0); u16(out, 0); u16(out, count); u16(out, count); u32(out, cd.length); u32(out, cdOffset); u16(out, 0);
+  return out.takeBytes();
+}
+
 class NewsItem {
   final String title, source;
   final DateTime? time;
@@ -1408,7 +1475,7 @@ String tradesToCsv(List<AppTrade> trades) {
 }
 
 String stratLabel(AppTrade t) => t.source == 'auto' ? 'Trend (auto)' : t.source == 'MR' ? 'Mean reversion (MR)'
-    : t.source == 'BOT' ? 'Bot: ${t.verdict}' : 'Manual';
+    : t.source == 'BOT' ? 'Bot: ${t.verdict}' : t.source == 'NEWS' ? 'News headline' : 'Manual';
 
 /// Minimal CSV parser (quoted fields, commas and line breaks inside quotes).
 List<List<String>> parseCsv(String text) {
@@ -1490,7 +1557,7 @@ class Edge {
   String get verdict => n < focusMinN ? 'too few trades' : proven ? 'PROVEN (both halves)' : losing ? 'LOSING (both halves)'
       : sumR > 0 ? 'profitable, not consistent' : 'mixed';
 }
-List<AppTrade> edgeSample(Iterable<AppTrade> all) => all.where((t) => !t.isOpen && t.reason != 'MANUAL').toList();
+List<AppTrade> edgeSample(Iterable<AppTrade> all) => all.where((t) => !t.isOpen && t.reason != 'MANUAL' && t.source != 'NEWS').toList();
 Edge edgeOf(List<AppTrade> g) {
   final s = [...g]..sort((a, b) => a.opened.compareTo(b.opened));
   final st = PStats(s);
@@ -1843,7 +1910,7 @@ class _HomeState extends State<Home> {
   Timer? botRecTimer;
   BotRec botFocusAcc = BotRec(), botFocusToday = BotRec();   // bot trades that were focus when they opened (runs on GitHub)
   int botFocusOpen = 0;
-  List<BotTrade> botFocusRecent = [];
+  List<BotTrade> botFocusRecent = [], botFocusAll = [];
   Map<String, dynamic>? expData;                                // Experiment lab summary (exp-data branch)
   String? expError;
   DateTime? expAt;
@@ -1851,6 +1918,11 @@ class _HomeState extends State<Home> {
   String expView = 'I', expTf = 'All';
   int expTarget = 1, expMinN = 20;
   bool expProvenOnly = false, expWorst = false;
+  bool newsAuto = true;                 // auto paper trades from news headlines, on all 6 timeframes
+  final Set<String> newsSeen = {};
+  bool newsTradeBusy = false;
+  String newsTradeStatus = '';
+  bool allLogsBusy = false;
   int paperSource = 1;                  // 0 = app indicators, 1 = bot focus signals, 2 = both
   bool sigFocusOnly = true;             // Signals tab: show only focus signals
   final Set<String> botSeen = {};       // bot signals already handled
@@ -2247,6 +2319,8 @@ class _HomeState extends State<Home> {
       focusMode = (p.getInt('app_paper_focus') ?? 0).clamp(0, 2).toInt();
       paperSource = (p.getInt('app_paper_src') ?? 1).clamp(0, 2).toInt();   // new installs and updates start on bot focus signals
       sigFocusOnly = p.getBool('app_sig_focus') ?? true;
+      newsAuto = p.getBool('app_news_auto') ?? true;
+      newsSeen..clear()..addAll(p.getStringList('app_news_seen') ?? const <String>[]);
       botSeen..clear()..addAll(p.getStringList('app_bot_seen') ?? const <String>[]);
       planRR = p.getDouble('app_paper_rr') ?? 1.0;
       if (planRR.isNaN || planRR < 0.5 || planRR > 10) planRR = 1.0;
@@ -2313,6 +2387,8 @@ class _HomeState extends State<Home> {
       await p.setInt('app_paper_focus', focusMode);
       await p.setInt('app_paper_src', paperSource);
       await p.setBool('app_sig_focus', sigFocusOnly);
+      await p.setBool('app_news_auto', newsAuto);
+      await p.setStringList('app_news_seen', newsSeen.toList().reversed.take(500).toList().reversed.toList());
       await p.setStringList('app_bot_seen', botSeen.toList().reversed.take(400).toList().reversed.toList());
       await p.setDouble('app_paper_rr', planRR);
       await p.setInt('app_paper_q', paperMinQ);
@@ -2373,6 +2449,7 @@ class _HomeState extends State<Home> {
         botFocusToday = today;
         botFocusOpen = openN;
         botFocusRecent = recent.reversed.take(15).toList();
+        botFocusAll = recent;
       }
       final m = <String, BotRec>{};
       for (final row in rows.skip(1)) {
@@ -2499,7 +2576,20 @@ class _HomeState extends State<Home> {
                 Text('All experiments at 1:${expTarget}: ${all[0]} trades, ${all[1 + o]}% wins, ${sg(all[2 + o])}R, PF ${all[3 + o]}',
                     style: TextStyle(fontWeight: FontWeight.w600, color: rc(all[2 + o]))),
               const SizedBox(height: 4),
+              Builder(builder: (_) {
+                final run = (d['run'] as Map?) ?? const {};
+                final nc = (run['news_coins'] as List?) ?? const [];
+                return Text(nc.isEmpty ? '"News headline": no new coin headline in the last run.' : '"News headline" last run: ${nc.join(', ')}',
+                    style: const TextStyle(fontSize: 11));
+              }),
+              const SizedBox(height: 4),
+              ElevatedButton.icon(
+                onPressed: allLogsBusy ? null : downloadAllLogsZip,
+                icon: const Icon(Icons.download_for_offline),
+                label: Text(allLogsBusy ? 'Collecting logs...' : 'Download all logs (one ZIP)'),
+              ),
               Text('Every indicator opens a virtual trade on each new signal, on every coin and timeframe, entering at the next candle. '
+                  '"News headline" trades each new coin headline from CoinDesk, Cointelegraph and Decrypt on all timeframes at the current price. '
                   'Each trade is followed to a 1:1 and a 1:2 target (stop 1.5 ATR, 0.05R fee). PROVEN = $minN+ trades, profit factor above 1.1 '
                   'and profit in both the older and the newer half. Many trades happen at the same moment on different coins, so only trust PROVEN rows.',
                   style: const TextStyle(fontSize: 11)),
@@ -2572,7 +2662,7 @@ class _HomeState extends State<Home> {
         }
         final coin = botCoin('${s['symbol']}');
         if (coin == null) { notCoin++; continue; }
-        if (trades.any((t) => t.isOpen && t.coin == coin)) { busy++; continue; }
+        if (trades.any((t) => t.isOpen && t.coin == coin && t.source != 'NEWS')) { busy++; continue; }
         if (trades.where((t) => t.isOpen && (t.source == 'auto' || t.source == 'MR' || t.source == 'BOT')).length >= paperMaxOpen) { busy++; continue; }
         final sl = (s['sl'] as num?)?.toDouble(), tp = (s['tp'] as num?)?.toDouble(), e0 = (s['entry'] as num?)?.toDouble();
         if (sl == null || tp == null || e0 == null) continue;
@@ -2878,7 +2968,7 @@ class _HomeState extends State<Home> {
         final cs = m['cs'] as List<Candle>;
         final isTrend = m['trend'] == true;
         final mrSig = m['mr'] as MrSignal?;
-        if (trades.any((t) => t.isOpen && t.coin == coin)) { sOpen++; continue; } // avoid duplicate exposure across timeframes
+        if (trades.any((t) => t.isOpen && t.coin == coin && t.source != 'NEWS')) { sOpen++; continue; } // avoid duplicate exposure across timeframes
         if (eventSoon(coin) != null) { sNews++; continue; }                         // same news blackout as the Final call
         final holdH = paperHoldHours[tf] ?? 48;
         final cooldown = trades.any((t) => !t.isOpen && t.coin == coin && t.tf == tf && t.closed != null &&
@@ -3132,7 +3222,9 @@ class _HomeState extends State<Home> {
     }
   }
 
-  Future<void> downloadAllLogs() async {
+  Future<void> downloadAllLogs() => downloadAllLogsZip();
+
+  Future<void> downloadAllLogsSeparate() async {
     var count = 0;
     if (trades.isNotEmpty) {
       await downloadCsv('app_paper_trades.csv', tradesToCsv(trades));
@@ -3413,6 +3505,7 @@ class _HomeState extends State<Home> {
       events = await fe;
       newsError = news.isEmpty ? 'No headlines could be loaded. Check your internet connection.' : null;
       newsUpdated = DateTime.now();
+      newsTradeCycle();
     } catch (e) {
       newsError = '$e';
     } finally {
@@ -4015,6 +4108,259 @@ class _HomeState extends State<Home> {
     });
   }
 
+  /// Opens paper trades from fresh headlines (60 minutes or newer) with a keyword score, on every timeframe.
+  Future<void> newsTradeCycle() async {
+    if (!newsAuto || !paperLoaded || newsTradeBusy || news.isEmpty) return;
+    final now = DateTime.now();
+    String key(NewsItem n) => '${n.source}|${n.title}';
+    final fresh = news.where((n) => n.time != null && n.score != 0 && now.difference(n.time!).inMinutes <= 60 && !newsSeen.contains(key(n))).toList();
+    if (fresh.isEmpty) return;
+    newsTradeBusy = true;
+    var opened = 0, heads = 0, noCoin = 0, busy = 0, failed = 0;
+    try {
+      for (final n in fresh.reversed) {                // oldest first
+        newsSeen.add(key(n));
+        final t = ' ${n.title.toLowerCase()} ';
+        final coins = [for (final e in newsCoinKeys.entries) if (futSymbols.containsKey(e.key) && e.value.any(t.contains)) e.key];
+        if (coins.isEmpty) { noCoin++; continue; }
+        final side = n.score > 0 ? 1 : -1;
+        var made = 0;
+        for (final coin in coins.take(3)) {
+          final px = await fetchPrice(coin);
+          if (px == null) { failed++; continue; }
+          for (final tf in mtfList) {
+            if (trades.any((x) => x.isOpen && x.source == 'NEWS' && x.coin == coin && x.tf == tf)) { busy++; continue; }
+            try {
+              final cs = await fetchCandles(coin, tf);
+              final a = cs.length < 20 ? double.nan : atrWilder(cs.sublist(0, cs.length - 1));
+              if (a.isNaN || a <= 0) { failed++; continue; }
+              final stop = newsStopAtr * a;
+              final riskUsd = paperAmount > 0 ? paperAmount * stop / px : paperEquity * paperRisk;
+              final id = trades.isEmpty ? 1 : trades.map((x) => x.id).reduce(math.max) + 1;
+              trades.add(AppTrade(
+                id: id, coin: coin, tf: tf, source: 'NEWS', verdict: n.title.length > 90 ? '${n.title.substring(0, 90)}...' : n.title,
+                side: side, buys: 0, sells: 0, neutrals: 0, mood: n.score, entry: px, sl: px - side * stop, tp: px + side * planRR * stop,
+                score: n.score.toDouble(), riskCash: riskUsd, amount: paperAmount > 0 ? paperAmount : 0, adx: null, atrPct: a / px * 100,
+                opened: DateTime.now(), regime: 'News', inds: n.source,
+              ));
+              opened++;
+              made++;
+            } catch (_) {
+              failed++;
+            }
+          }
+        }
+        if (made > 0) {
+          heads++;
+          notifyPaper(trades.last.id, 'News trades opened: ${coins.take(3).join(', ')} ${side == 1 ? 'BUY' : 'SELL'} ($made timeframes)', n.title);
+        }
+      }
+      await savePaper();
+      final parts = <String>[
+        if (noCoin > 0) '$noCoin headlines name no tradable coin',
+        if (busy > 0) '$busy coin/timeframe already has a news trade',
+        if (failed > 0) '$failed price or candle errors',
+      ];
+      newsTradeStatus = 'News trades ${hhmm(DateTime.now())}: ${fresh.length} new headlines, $opened trades from $heads of them.'
+          '${parts.isEmpty ? '' : ' Skipped: ${parts.join(', ')}.'}';
+    } catch (e) {
+      newsTradeStatus = 'News trading could not run: $e';
+    } finally {
+      newsTradeBusy = false;
+      if (mounted) setState(() {});
+    }
+  }
+
+  Widget newsTradesCard() {
+    final nt = trades.where((t) => t.source == 'NEWS').toList();
+    final closed = nt.where((t) => !t.isOpen).toList();
+    final st = PStats(closed);
+    String line(String label, Iterable<AppTrade> l) {
+      final p = PStats(l);
+      final open = l.where((t) => t.isOpen).length;
+      return '$label: ${p.n} closed${p.n == 0 ? '' : ', ${p.winPct.toStringAsFixed(0)}% wins, ${p.sumR >= 0 ? '+' : ''}${p.sumR.toStringAsFixed(1)}R'}${open > 0 ? ', $open open' : ''}';
+    }
+    final recent = nt.reversed.take(20).toList();
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            const Expanded(child: Text('Auto paper trades from news', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15))),
+            Switch(value: newsAuto, onChanged: (v) { setState(() => newsAuto = v); savePaper(); if (v) newsTradeCycle(); }),
+          ]),
+          Text('A new headline (60 min or newer) with a bullish or bearish keyword score that names a coin opens a paper trade on that coin on '
+              'all 6 timeframes (${mtfList.join(', ')}): BUY for bullish, SELL for bearish. Stop ${newsStopAtr.toStringAsFixed(1)} ATR of that timeframe, '
+              'target 1:${fmtRR(planRR)} (your setting), normal time limit per timeframe. One news trade per coin and timeframe at a time. '
+              'Runs while the app is open or minimized. Separate from the other auto trades.', style: const TextStyle(fontSize: 11)),
+          if (newsTradeStatus.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 4), child: Text(newsTradeStatus, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600))),
+          const SizedBox(height: 6),
+          Text(nt.isEmpty ? 'No news trades yet.' : line('All news trades', nt),
+              style: TextStyle(fontWeight: FontWeight.w600, color: st.n == 0 ? null : st.sumR >= 0 ? Colors.green : Colors.red)),
+          if (nt.isNotEmpty) ...[
+            for (final sd in const [1, -1]) Text(line(sd == 1 ? 'BUY (bullish)' : 'SELL (bearish)', nt.where((t) => t.side == sd)), style: const TextStyle(fontSize: 12)),
+            for (final tf in mtfList) Text(line(tf, nt.where((t) => t.tf == tf)), style: const TextStyle(fontSize: 12)),
+            const SizedBox(height: 6),
+            const Text('Latest news trades (tap to see on the chart)', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+            for (final t in recent)
+              InkWell(
+                onTap: () => openTrade(t, context),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 3),
+                  child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Expanded(child: Text('${t.side == 1 ? 'BUY' : 'SELL'} ${t.coin} ${t.tf}  ${ago(t.opened.toIso8601String())}\n${t.verdict}',
+                        maxLines: 3, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12))),
+                    Text(t.isOpen ? 'OPEN' : '${t.reason}\n${t.r >= 0 ? '+' : ''}${t.r.toStringAsFixed(2)}R', textAlign: TextAlign.right,
+                        style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: t.isOpen ? Colors.grey : t.r >= 0 ? Colors.green : Colors.red)),
+                  ]),
+                ),
+              ),
+          ],
+        ]),
+      ),
+    );
+  }
+
+  /// Every log in one ZIP file: app trades, profit analysis, bot log, bot focus account, Lab, news and Experiment lab.
+  Future<void> downloadAllLogsZip() async {
+    if (allLogsBusy) return;
+    allLogsBusy = true;
+    if (mounted) setState(() {});
+    toast('Collecting all logs...');
+    try {
+      final files = <String, String>{};
+      final notes = <String>[];
+      if (trades.isNotEmpty) {
+        files['app_paper_trades.csv'] = tradesToCsv(trades);
+        files['app_trade_indicators.csv'] = tradeIndicatorsCsv(trades);
+        if (trades.any((t) => !t.isOpen)) files['app_profit_analysis.csv'] = profitAnalysisCsv(trades);
+        final nt = trades.where((t) => t.source == 'NEWS').toList();
+        if (nt.isNotEmpty) files['news_trades.csv'] = tradesToCsv(nt);
+      }
+      if (news.isNotEmpty) {
+        files['news_headlines.csv'] = [
+          'time_utc,source,score,title',
+          for (final n in news) [n.time?.toUtc().toIso8601String() ?? '', csvCell(n.source), n.score, csvCell(n.title)].join(','),
+        ].join('\n') + '\n';
+      }
+      final bot = await fetchPaperCsv();
+      if (bot != null) { files['bot_paper_log.csv'] = bot; } else { notes.add('bot_paper_log.csv: could not download the bot log.'); }
+      if (botFocusAll.isNotEmpty) {
+        files['bot_focus_account.csv'] = [
+          'opened_utc,closed_utc,symbol,side,strategy,tf,status,r_multiple',
+          for (final t in botFocusAll)
+            [t.opened.toUtc().toIso8601String(), t.closed?.toUtc().toIso8601String() ?? '', t.sym, t.side, csvCell(t.strat), t.tf, t.status, t.r ?? ''].join(','),
+        ].join('\n') + '\n';
+      }
+      if (labAgg.isNotEmpty || labRows.isNotEmpty || labPending.isNotEmpty) {
+        files['lab_indicator_accuracy.csv'] = labAggCsv(labAgg);
+        files['lab_signal_snapshots.csv'] = labRowsCsv(labRows);
+        files['lab_trades.csv'] = labTradesCsvAll();
+      }
+      // Experiment lab files from the exp-data branch on GitHub
+      final eu = expUrl();
+      if (eu != null) {
+        await loadExp();
+        final d = expData;
+        if (d != null) {
+          files['experiments_summary.csv'] = expSummaryCsv(d);
+        } else {
+          notes.add('experiments_summary.csv: ${expError ?? 'not available'}');
+        }
+        for (final f in const ['exp_stats.json', 'exp_state.json']) {
+          try {
+            final r = await http.get(Uri.parse('${eu.replaceAll('exp_summary.json', f)}?t=${DateTime.now().millisecondsSinceEpoch}')).timeout(const Duration(seconds: 60));
+            if (r.statusCode != 200) { notes.add('$f: HTTP ${r.statusCode}'); continue; }
+            final j = jsonDecode(r.body);
+            if (f == 'exp_stats.json') files['experiments_daily.csv'] = expDailyCsv(j as Map<String, dynamic>);
+            if (f == 'exp_state.json') files['experiments_open_trades.csv'] = expOpenCsv(j as Map<String, dynamic>);
+          } catch (e) {
+            notes.add('$f: $e');
+          }
+        }
+      }
+      if (files.isEmpty) {
+        toast('No logs are available to download yet.');
+        return;
+      }
+      files['README.txt'] = [
+        'Signal Bot logs, ${DateTime.now().toUtc().toIso8601String()} UTC',
+        '',
+        for (final k in files.keys) k,
+        if (notes.isNotEmpty) ...['', 'Not included:', ...notes],
+      ].join('\n') + '\n';
+      final bytes = zipFiles(files);
+      final ts = DateTime.now();
+      String two(int v) => v.toString().padLeft(2, '0');
+      final name = 'signal_bot_logs_${ts.year}${two(ts.month)}${two(ts.day)}_${two(ts.hour)}${two(ts.minute)}.zip';
+      final saved = await FilePicker.platform.saveFile(
+        dialogTitle: 'Save all logs',
+        fileName: name,
+        type: FileType.custom,
+        allowedExtensions: const ['zip'],
+        bytes: bytes,
+      );
+      toast(saved == null ? 'Download cancelled.' : 'Saved ${files.length - 1} logs in $name.');
+    } catch (e) {
+      toast('Could not save the logs: $e');
+    } finally {
+      allLogsBusy = false;
+      if (mounted) setState(() {});
+    }
+  }
+
+  String labTradesCsvAll() {
+    final lines = ['indicator,time_utc,coin,tf,style,side,entry,target,stop,atr,result,r_multiple,move_atr_at_horizon'];
+    void add(LabSnap x, bool open) {
+      x.votes.forEach((n, sd) {
+        final tr = LabTrade(x, sd, open);
+        lines.add([csvCell(n), x.t0.toUtc().toIso8601String(), x.coin, x.tf, styleOf(x.tf), sd == 1 ? 'BUY' : 'SELL', x.price, tr.tp, tr.sl, x.atr,
+          tr.result, open ? '' : tr.r.toStringAsFixed(3), open ? '' : x.move.toStringAsFixed(3)].join(','));
+      });
+    }
+    for (final x in labRows) { add(x, false); }
+    for (final x in labPending) { add(x, true); }
+    return lines.join('\n') + '\n';
+  }
+
+  String expSummaryCsv(Map<String, dynamic> d) {
+    final lines = ['view,name,timeframe,side,coin,n,win_pct_1to1,R_1to1,pf_1to1,R_1to1_older_half,R_1to1_newer_half,'
+        'win_pct_1to2,R_1to2,pf_1to2,R_1to2_older_half,R_1to2_newer_half'];
+    final rows = (d['rows'] as Map? ?? {}).cast<String, dynamic>();
+    const views = {'all': 'All', 'I': 'Indicator', 'i': 'Indicator + timeframe', 'c': 'Coin', 't': 'Timeframe', 'ic': 'Indicator + coin'};
+    for (final e in rows.entries) {
+      final p = e.key.split('|');
+      final v = p[0];
+      String name = '', tf = '', side = '', coin = '';
+      if (v == 'I') { name = p[1]; side = p[2]; }
+      if (v == 'i') { name = p[1]; tf = p[2]; side = p[3]; }
+      if (v == 'c') { coin = p[1]; side = p[2]; }
+      if (v == 't') { tf = p[1]; side = p[2]; }
+      if (v == 'ic') { name = p[1]; side = p[2]; coin = p[3]; }
+      lines.add([views[v] ?? v, csvCell(name), tf, side, coin, ...(e.value as List)].join(','));
+    }
+    return lines.join('\n') + '\n';
+  }
+
+  String expDailyCsv(Map<String, dynamic> j) {
+    final lines = ['day,key,n,wins_1to1,R_1to1,loss_R_1to1,wins_1to2,R_1to2,loss_R_1to2'];
+    for (final d in j.entries) {
+      for (final e in (d.value as Map).entries) {
+        lines.add([d.key, csvCell('${e.key}'), ...(e.value as List)].join(','));
+      }
+    }
+    return lines.join('\n') + '\n';
+  }
+
+  String expOpenCsv(Map<String, dynamic> j) {
+    final lines = ['indicator,coin,tf,side,entry,stop_distance,entry_day,bars_held,result_1to1_so_far,result_1to2_so_far'];
+    for (final t in (j['open'] as List? ?? const [])) {
+      final m = t as Map;
+      lines.add([csvCell('${m['k']}'), m['c'], m['tf'], m['s'] == 1 ? 'BUY' : 'SELL', m['e'], m['r'], m['d'], m['b'], m['o1'] ?? '', m['o2'] ?? ''].join(','));
+    }
+    return lines.join('\n') + '\n';
+  }
+
   Widget newsTab() {
     final shown = news.where((n) {
       if (newsFilter == 'Bullish') return n.score > 0;
@@ -4049,6 +4395,7 @@ class _HomeState extends State<Home> {
           const SizedBox(height: 4),
           const Text('The Final call shows WAIT when an event for the pair is within 45 minutes.', style: TextStyle(fontSize: 11)),
         ]))),
+        newsTradesCard(),
         Wrap(spacing: 8, children: [
           for (final f in ['All', 'Selected: $marketSymbol', 'Bullish', 'Bearish'])
             ChoiceChip(label: Text(f), selected: newsFilter == f || (f.startsWith('Selected') && newsFilter.startsWith('Selected')), onSelected: (_) => setState(() => newsFilter = f)),
@@ -4910,7 +5257,7 @@ class _HomeState extends State<Home> {
               OutlinedButton.icon(onPressed: shareDetailLogs, icon: const Icon(Icons.share), label: const Text('Share detail logs')),
               OutlinedButton.icon(onPressed: copyAppLog, icon: const Icon(Icons.copy), label: const Text('Copy')),
               OutlinedButton.icon(onPressed: downloadBotLog, icon: const Icon(Icons.download), label: const Text('Download bot log')),
-              OutlinedButton.icon(onPressed: downloadAllLogs, icon: const Icon(Icons.download_for_offline), label: const Text('Download all logs')),
+              OutlinedButton.icon(onPressed: downloadAllLogs, icon: const Icon(Icons.download_for_offline), label: const Text('Download all logs (one ZIP)')),
             ]),
             const SizedBox(height: 6),
             const Text('Profit analysis: one row per coin, timeframe, indicator, side, hour and regime with trades, win rate, net R, profit factor and a PROFITABLE / losing label (rows under 10 trades say "too few trades"). Detail logs also include one row per trade and agreeing indicator for pivot tables.', style: TextStyle(fontSize: 11)),
@@ -5055,7 +5402,7 @@ class _HomeState extends State<Home> {
             Wrap(spacing: 8, children: [
               ElevatedButton.icon(onPressed: downloadLabAcc, icon: const Icon(Icons.download), label: const Text('Download accuracy table')),
               OutlinedButton.icon(onPressed: downloadLabRows, icon: const Icon(Icons.download), label: const Text('Download raw snapshots')),
-              OutlinedButton.icon(onPressed: downloadAllLogs, icon: const Icon(Icons.download_for_offline), label: const Text('Download all logs')),
+              OutlinedButton.icon(onPressed: downloadAllLogs, icon: const Icon(Icons.download_for_offline), label: const Text('Download all logs (one ZIP)')),
             ]),
             Align(alignment: Alignment.centerRight, child: TextButton.icon(onPressed: resetLab, icon: const Icon(Icons.delete_outline), label: const Text('Reset Lab'))),
           ]),
