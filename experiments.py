@@ -14,8 +14,10 @@ Self-contained on purpose: it does not import the bot's own files, so it works w
 """
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import numpy as np
 import pandas as pd
@@ -32,6 +34,23 @@ FEE = 0.05
 SL_ATR = 1.5
 MIN_N = 50                                        # trades needed before a row can be called proven or losing
 EXCLUDE = {"USDC", "FDUSD", "TUSD", "DAI", "USDE", "BUSD", "USDP"}
+
+# News headline experiment: same keyword score and coin names as the app's News tab
+NEWS_NAME = "News headline"
+NEWS_MAX_AGE_MIN = 60
+NEWS_FEEDS = {"CoinDesk": "https://www.coindesk.com/arc/outboundfeeds/rss/", "Cointelegraph": "https://cointelegraph.com/rss",
+              "Decrypt": "https://decrypt.co/feed"}
+BULL = ['surge', 'rally', 'soar', 'approve', 'inflow', 'adoption', 'rate cut', 'beats', 'record high', 'gains', 'bullish', 'jumps',
+        'rebound', 'recovers', 'upgrade', 'breakout', 'etf approval']
+BEAR = ['crash', 'plunge', 'hack', 'exploit', 'ban ', 'lawsuit', 'sues', 'rate hike', 'liquidat', 'fears', 'selloff', 'sell-off',
+        'bearish', 'slump', 'tumbles', 'warns', 'outflow', 'downgrade', 'sanction', 'default']
+NEWS_KEYS = {
+    'BTC': ['bitcoin', ' btc'], 'ETH': ['ethereum', ' eth '], 'SOL': ['solana'], 'BNB': [' bnb', 'binance coin'], 'XRP': [' xrp', 'ripple'],
+    'DOGE': ['dogecoin', ' doge'], 'ADA': ['cardano'], 'AVAX': ['avalanche'], 'LINK': ['chainlink'], 'DOT': ['polkadot'], 'LTC': ['litecoin'],
+    'TRX': [' tron '], 'TON': ['toncoin'], 'SUI': [' sui '], 'SHIB': ['shiba inu'], 'UNI': ['uniswap'], 'AAVE': [' aave'], 'ARB': ['arbitrum'],
+    'OP': ['optimism'], 'APT': ['aptos'], 'HYPE': ['hyperliquid'], 'ENA': ['ethena'], 'WLD': ['worldcoin'], 'BCH': ['bitcoin cash'],
+    'PEPE': [' pepe'], 'XLM': ['stellar'], 'HBAR': ['hedera'], 'NEAR': ['near protocol'], 'ATOM': ['cosmos'], 'FIL': ['filecoin'],
+}
 
 
 # ---------------------------------------------------------------- data
@@ -75,6 +94,80 @@ def candles(coin, tf):
         df[c] = df[c].astype(float)
     df["closed"] = df.pop("confirm").astype(str) == "1"
     return df.sort_values("ts").reset_index(drop=True)
+
+
+def unescape(t):
+    for a, b in (('<![CDATA[', ''), (']]>', ''), ('&amp;', '&'), ('&#39;', "'"), ('&#8217;', "'"), ('&quot;', '"'), ('&lt;', '<'), ('&gt;', '>')):
+        t = t.replace(a, b)
+    return t.strip()
+
+
+def score_title(t):
+    x = f" {t.lower()} "
+    return sum(w in x for w in BULL) - sum(w in x for w in BEAR)
+
+
+def parse_rss(body, source):
+    out = []
+    for m in re.finditer(r'<item[\s>](.*?)</item>', body, re.S):
+        blk = m.group(1)
+        t = re.search(r'<title[^>]*>(.*?)</title>', blk, re.S)
+        d = re.search(r'<pubDate[^>]*>(.*?)</pubDate>', blk, re.S)
+        if not t or not d:
+            continue
+        try:
+            pub = int(parsedate_to_datetime(d.group(1).strip()).timestamp() * 1000)
+        except Exception:
+            continue
+        title = unescape(t.group(1))
+        out.append((f"{source}|{title}", title, pub, score_title(title)))
+    return out
+
+
+def news_coins(title, coins):
+    x = f" {title.lower()} "
+    return [c for c, ks in NEWS_KEYS.items() if c in coins and any(k in x for k in ks)]
+
+
+def news_signals(st, coins, now_ms, fetch=None):
+    # coin -> +1 / -1 from new headlines (60 minutes or newer) that name it; several headlines on one coin are added up
+    seen = dict.fromkeys(st.get("news_seen", []))
+    total, heads = {}, []
+    for src, url in NEWS_FEEDS.items():
+        try:
+            body = fetch(url) if fetch else requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15).text
+        except Exception:
+            continue
+        for key, title, pub, sc in parse_rss(body, src):
+            tkey = "T|" + title.lower()                  # the same story on several sites counts once
+            if key in seen or tkey in seen or now_ms - pub > NEWS_MAX_AGE_MIN * 60000 or pub > now_ms + 300000:
+                continue
+            seen[key] = None
+            seen[tkey] = None
+            if sc == 0:
+                continue
+            for c in news_coins(title, coins):
+                total[c] = total.get(c, 0) + sc
+                heads.append(title)
+    st["news_seen"] = list(seen)[-800:]
+    return {c: (1 if v > 0 else -1) for c, v in total.items() if v != 0}, heads
+
+
+def open_news(coin, tf, df, st, side):
+    # entry at the current price (after the headline); only candles that start later can hit the stop or target
+    if df is None or len(df) < 30:
+        return 0
+    if any(t["k"] == NEWS_NAME and t["c"] == coin and t["tf"] == tf for t in st["open"]):
+        return 0
+    cl = df[df["closed"]].reset_index(drop=True)
+    a = atr(cl["high"].values, cl["low"].values, cl["close"].values, 14)[-1] if len(cl) > 15 else np.nan
+    if np.isnan(a) or a <= 0:
+        return 0
+    last = df.iloc[-1]
+    st["open"].append({"k": NEWS_NAME, "c": coin, "tf": tf, "s": int(side), "e": float(last["close"]), "r": float(SL_ATR * a),
+                       "chk": int(last["ts"]), "b": 0, "o1": None, "o2": None,
+                       "d": datetime.now(timezone.utc).strftime("%Y-%m-%d")})
+    return 1
 
 
 # ---------------------------------------------------------------- indicator helpers
@@ -467,6 +560,12 @@ def main():
     # coins that dropped out of the top list keep being followed until their open trades close
     follow = list(dict.fromkeys(coins + sorted({t["c"] for t in st["open"]})))
     opened = errors = 0
+    try:
+        nsig, heads = news_signals(st, set(coins), int(time.time() * 1000))
+    except Exception as e:
+        nsig, heads = {}, []
+        print(f"news: {e}")
+    news_opened = 0
     for coin in follow:
         for tf in TFS:
             in_top = coin in coins
@@ -477,13 +576,18 @@ def main():
                 if not in_top and df is not None and df["closed"].any():
                     st["last"][f"{coin}|{tf}"] = int(df.loc[df["closed"], "ts"].max())   # resolve only, no new trades
                 opened += process(coin, tf, df, st, stats)
+                if in_top and coin in nsig:
+                    k = open_news(coin, tf, df, st, nsig[coin])
+                    opened += k
+                    news_opened += k
             except Exception as e:
                 errors += 1
                 print(f"{coin} {tf}: {e}")
     cutoff = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=KEEP_DAYS)).strftime("%Y-%m-%d")
     stats = {d: v for d, v in stats.items() if d >= cutoff}
     st["coins"] = coins
-    info = {"opened": opened, "errors": errors, "seconds": round(time.time() - t0, 1)}
+    info = {"opened": opened, "errors": errors, "seconds": round(time.time() - t0, 1), "news_trades": news_opened,
+            "news_coins": sorted(nsig), "news_headlines": heads[:10]}
     save("exp_state.json", st)
     save("exp_stats.json", stats)
     save("exp_summary.json", summary(stats, st, coins, info))
