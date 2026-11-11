@@ -2591,7 +2591,9 @@ class _HomeState extends State<Home> {
               Builder(builder: (_) {
                 final run = (d['run'] as Map?) ?? const {};
                 final nc = (run['news_coins'] as List?) ?? const [];
-                return Text(nc.isEmpty ? '"News headline": no new coin headline in the last run.' : '"News headline" last run: ${nc.join(', ')}',
+                final fd = (run['news_feeds'] as Map?) ?? const {};
+                return Text('${nc.isEmpty ? '"News headline": no new coin headline in the last run.' : '"News headline" last run: ${nc.join(', ')}'}'
+                    '${fd.isEmpty ? '' : '\nNews feeds from GitHub: ${fd.entries.map((e) => '${e.key} ${e.value}').join(', ')}'}',
                     style: const TextStyle(fontSize: 11));
               }),
               const SizedBox(height: 4),
@@ -4279,6 +4281,8 @@ class _HomeState extends State<Home> {
         final d = expData;
         if (d != null) {
           files['experiments_summary.csv'] = expSummaryCsv(d);
+          files['experiments_last_run.json'] = const JsonEncoder.withIndent('  ').convert(
+              {'updated': d['updated'], 'coins': d['coins'], 'tfs': d['tfs'], 'open': d['open'], 'closed': d['closed'], 'run': d['run']});
         } else {
           notes.add('experiments_summary.csv: ${expError ?? 'not available'}');
         }
