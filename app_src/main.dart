@@ -1518,6 +1518,64 @@ class BotRec {
   String get text => '$n trades, ${winPct.toStringAsFixed(0)}% wins, ${sumR >= 0 ? '+' : ''}${sumR.toStringAsFixed(1)}R, PF ${pf.toStringAsFixed(2)}';
 }
 
+// ---- GitHub files with a backup route ----
+// Some networks cannot reach raw.githubusercontent.com (seen Nov 11: "Failed host lookup", "Connection reset").
+// Then the same file is read through the GitHub API (api.github.com). Without a login the API allows 60 requests an
+// hour, so each file is read that way at most every 2 minutes and the last copy is reused in between.
+DateTime? _rawDownAt;
+final Map<String, DateTime> _apiLast = {};
+final Map<String, http.Response> _apiCache = {};
+bool ghViaApi = false;   // true while files come through the backup route
+
+Future<http.Response> ghGet(String rawUrl, {Duration timeout = const Duration(seconds: 30)}) async {
+  final u = Uri.parse(rawUrl);
+  final now = DateTime.now();
+  final isRaw = u.host == 'raw.githubusercontent.com' && u.pathSegments.length >= 4;
+  Object? rawErr;
+  final skipRaw = isRaw && _rawDownAt != null && now.difference(_rawDownAt!).inMinutes < 5;
+  if (!skipRaw) {
+    try {
+      final r = await http.get(u.replace(queryParameters: {'t': '${now.millisecondsSinceEpoch}'})).timeout(timeout);
+      if (r.statusCode == 200 || r.statusCode == 404 || !isRaw) {
+        if (r.statusCode == 200) { _rawDownAt = null; ghViaApi = false; }
+        return r;
+      }
+      rawErr = 'HTTP ${r.statusCode}';
+    } catch (e) {
+      if (!isRaw) rethrow;
+      rawErr = e;
+    }
+    _rawDownAt = now;
+  }
+  final key = u.path;
+  final last = _apiLast[key], cached = _apiCache[key];
+  if (last != null && cached != null && now.difference(last).inSeconds < 120) return cached;
+  _apiLast[key] = now;
+  final sg = u.pathSegments;              // owner, repo, branch, file path...
+  final api = Uri.https('api.github.com', '/repos/${sg[0]}/${sg[1]}/contents/${sg.sublist(3).join('/')}', {'ref': sg[2]});
+  http.Response r;
+  try {
+    r = await http.get(api, headers: {'Accept': 'application/vnd.github.raw', 'User-Agent': 'signal-bot-app'}).timeout(timeout);
+  } catch (e) {
+    if (cached != null) return cached;
+    throw rawErr ?? e;
+  }
+  if (r.statusCode == 200) { _apiCache[key] = r; ghViaApi = true; return r; }
+  if (cached != null) return cached;
+  if (r.statusCode == 403 || r.statusCode == 429) throw 'GitHub backup route is busy (hourly limit reached). It retries automatically.';
+  return r;
+}
+
+/// Short message for network errors instead of the raw exception text.
+String netMsg(Object e) {
+  final t = '$e';
+  if (t.contains('Failed host lookup') || t.contains('Connection reset') || t.contains('SocketException') || t.contains('HandshakeException')) {
+    return 'This network cannot reach GitHub right now (raw.githubusercontent.com and api.github.com). '
+        'Try mobile data or another Wi-Fi, or set Private DNS to dns.google (Settings > Network > Private DNS).';
+  }
+  return t;
+}
+
 /// One row of the GitHub bot's paper log.
 class BotTrade {
   final String key, sym, side, strat, tf, status;
@@ -2416,10 +2474,11 @@ class _HomeState extends State<Home> {
   Future<void> loadBotRec() async {
     if (feedUrl.isEmpty) return;
     try {
+      if (botRec.isEmpty) await loadBotRecSaved();
       final url = feedUrl.replaceAll('feed.json', 'paper_log.csv');
-      final r = await http.get(Uri.parse('$url?t=${DateTime.now().millisecondsSinceEpoch}')).timeout(const Duration(seconds: 30));
+      final r = await ghGet(url);
       if (r.statusCode != 200) throw 'HTTP ${r.statusCode}';
-      final rows = parseCsv(r.body);
+      final rows = parseCsv(utf8.decode(r.bodyBytes));
       if (rows.isEmpty) throw 'empty file';
       final h = rows.first;
       final iS = h.indexOf('strategy'), iSide = h.indexOf('side'), iSym = h.indexOf('symbol'), iSt = h.indexOf('status'), iR = h.indexOf('r_multiple');
@@ -2476,8 +2535,10 @@ class _HomeState extends State<Home> {
       botRec = m;
       botRecAt = DateTime.now();
       botRecError = null;
+      saveBotRec();
     } catch (e) {
-      botRecError = 'Bot track record could not load ($e).';
+      botRecError = botRec.isEmpty ? 'Bot track record could not load. ${netMsg(e)}'
+          : 'Could not refresh the bot record, using the copy from ${botRecAt == null ? '-' : hhmm(botRecAt!)}. ${netMsg(e)}';
     }
     if (mounted) setState(() {});
   }
@@ -2495,17 +2556,17 @@ class _HomeState extends State<Home> {
       return;
     }
     try {
-      final r = await http.get(Uri.parse('$url?t=${DateTime.now().millisecondsSinceEpoch}')).timeout(const Duration(seconds: 30));
+      final r = await ghGet(url);
       if (r.statusCode == 404) {
         throw 'No experiment data yet. Add experiments.py and .github/workflows/experiments.yml to your repo, then open GitHub > Actions > '
             '"Experiment lab" > Run workflow. Results appear here about 3 minutes later.';
       }
       if (r.statusCode != 200) throw 'Could not load experiment results (HTTP ${r.statusCode}).';
-      expData = jsonDecode(r.body) as Map<String, dynamic>;
+      expData = jsonDecode(utf8.decode(r.bodyBytes)) as Map<String, dynamic>;
       expAt = DateTime.now();
       expError = null;
     } catch (e) {
-      expError = '$e';
+      expError = expData == null ? netMsg(e) : 'Could not refresh, showing the copy from ${expAt == null ? '-' : hhmm(expAt!)}. ${netMsg(e)}';
     }
     if (mounted) setState(() {});
   }
@@ -2646,6 +2707,40 @@ class _HomeState extends State<Home> {
         if (keys.length > 60) Text('Showing 60 of ${keys.length}.', style: const TextStyle(fontSize: 11)),
       ]),
     );
+  }
+
+  /// Saved copy of the bot record, so Focus still works when GitHub cannot be reached.
+  Future<void> saveBotRec() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      await p.setString('app_bot_rec', jsonEncode({
+        'at': botRecAt?.toIso8601String(),
+        'rec': {for (final e in botRec.entries) e.key: [e.value.n, e.value.wins, e.value.sumR, e.value.gw, e.value.gl]},
+      }));
+    } catch (_) {}
+  }
+
+  Future<void> loadBotRecSaved() async {
+    try {
+      final p = await SharedPreferences.getInstance();
+      final t = p.getString('app_bot_rec');
+      if (t == null) return;
+      final j = jsonDecode(t) as Map<String, dynamic>;
+      final m = <String, BotRec>{};
+      (j['rec'] as Map).forEach((k, v) {
+        final a = (v as List).cast<num>();
+        m['$k'] = BotRec()
+          ..n = a[0].toInt()
+          ..wins = a[1].toInt()
+          ..sumR = a[2].toDouble()
+          ..gw = a[3].toDouble()
+          ..gl = a[4].toDouble();
+      });
+      if (m.isNotEmpty && botRec.isEmpty) {
+        botRec = m;
+        botRecAt = DateTime.tryParse('${j['at']}');
+      }
+    } catch (_) {}
   }
 
   BotRec? recOf(Map<String, dynamic> s) => botRec['${s['strategy']}|${s['side']}'];
@@ -3706,16 +3801,14 @@ class _HomeState extends State<Home> {
     }
     if (!silent) setState(() => loading = true);
     try {
-      final r = await http
-          .get(Uri.parse('$feedUrl?t=${DateTime.now().millisecondsSinceEpoch}'))
-          .timeout(const Duration(seconds: 20));
+      final r = await ghGet(feedUrl, timeout: const Duration(seconds: 20));
       if (r.statusCode != 200) {
         throw 'Feed not found (HTTP ${r.statusCode}). Run the bot once and make sure the repo is public.';
       }
-      data = jsonDecode(r.body) as Map<String, dynamic>;
+      data = jsonDecode(utf8.decode(r.bodyBytes)) as Map<String, dynamic>;
       error = null;
     } catch (e) {
-      error = '$e';
+      error = netMsg(e);
     }
     if (mounted) setState(() => loading = false);
   }
@@ -4288,9 +4381,9 @@ class _HomeState extends State<Home> {
         }
         for (final f in const ['exp_stats.json', 'exp_state.json']) {
           try {
-            final r = await http.get(Uri.parse('${eu.replaceAll('exp_summary.json', f)}?t=${DateTime.now().millisecondsSinceEpoch}')).timeout(const Duration(seconds: 60));
+            final r = await ghGet(eu.replaceAll('exp_summary.json', f), timeout: const Duration(seconds: 60));
             if (r.statusCode != 200) { notes.add('$f: HTTP ${r.statusCode}'); continue; }
-            final j = jsonDecode(r.body);
+            final j = jsonDecode(utf8.decode(r.bodyBytes));
             if (f == 'exp_stats.json') files['experiments_daily.csv'] = expDailyCsv(j as Map<String, dynamic>);
             if (f == 'exp_state.json') files['experiments_open_trades.csv'] = expOpenCsv(j as Map<String, dynamic>);
           } catch (e) {
@@ -4499,6 +4592,10 @@ class _HomeState extends State<Home> {
                 : 'A signal is FOCUS when its strategy + direction already has $botFocusMinN+ closed bot paper trades with a net profit. '
                   'Bot record: ${allRec?.text ?? '-'}. Updated ${botRecAt == null ? '-' : hhmm(botRecAt!)}.',
                 style: const TextStyle(fontSize: 12)),
+            if (botRec.isNotEmpty && botRecError != null) Text(botRecError!, style: const TextStyle(fontSize: 11, color: Colors.orange)),
+            if (botRec.isEmpty && sigFocusOnly) const Text('Focus cannot be checked without the bot record, so ALL signals are shown below.',
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w700, color: Colors.orange)),
+            if (ghViaApi) const Text('GitHub files are coming through the backup route (api.github.com), refreshed at most every 2 minutes.', style: TextStyle(fontSize: 11)),
             const SizedBox(height: 4),
             const Text('Tested on 2,201 past bot trades, using only data known at the time: all signals -70.8R, focus signals +81.4R '
                 '(profit factor 1.21). Uses the bot\'s own stop and target. Past paper results, not a guarantee.', style: TextStyle(fontSize: 11)),
@@ -4596,14 +4693,14 @@ class _HomeState extends State<Home> {
   Future<String?> fetchPaperCsv() async {
     try {
       final url = feedUrl.replaceAll('feed.json', 'paper_log.csv');
-      final r = await http.get(Uri.parse(url)).timeout(const Duration(seconds: 30));
+      final r = await ghGet(url);
       if (r.statusCode != 200) {
         toast('Paper log is not published yet (HTTP ${r.statusCode}). It is published after a successful bot scan; it may contain only the CSV header until a paper position is opened.');
         return null;
       }
       return utf8.decode(r.bodyBytes);
     } catch (e) {
-      toast('Could not download the log: $e');
+      toast('Could not download the log: ${netMsg(e)}');
       return null;
     }
   }
