@@ -210,3 +210,14 @@ Walk-forward test on 2,201 closed GitHub bot trades (Oct 30 - Nov 9), using only
 * **Experiment lab, 3 days (25,373 trades)**: -3,208R at 1:1. Best: Stochastic SELL +57.4R / 313 (positive 2 of 3 days), CCI reversal SELL +32.8R, Z-score SELL +31.0R; all mean-reversion SELL lost on Nov 11 so far. "+ trend" versions lost more than the plain ones (CCI + trend SELL -67.0R, RSI 2 + trend SELL -61.2R), in line with the 8-day check: the trend filter does not help.
 * **App Lab**: plain SELL +128.7R over 610, plain BUY 0.0R over 1,276, "+ trend" SELL -21.5R over 118.
 * **News**: app traded one headline (BTC SELL on 6 timeframes, 1 closed at TP +0.95R); the keyword score read "resume withdrawals after $49M hack" as bearish. The cloud News headline experiment opened no trade in 3 days. Change: the lab now records each news feed's status (items or HTTP error) and adds Google News as a backup feed; the Experiments tab and experiments_last_run.json in the logs ZIP show it.
+
+## Update 15: GitHub schedules moved off the busy minutes
+* The Actions page (Nov 11) showed every run succeeding but most scheduled runs skipped: Experiment lab at run #7 after about 1.5 days (every 10 minutes would be about 200), Signal bot gaps of 3 hours or more. GitHub drops scheduled runs under load, mostly at round minutes.
+* Signal bot scan: "*/5" -> "2,7,12,...,57" (still every 5 minutes). Experiment lab: "*/10" -> "4,14,...,54". Daily and weekly report lines unchanged (main.yml matches them by their exact text).
+* For dependable timing, an outside timer (cron-job.org) can start the workflows through GitHub's workflow_dispatch API with a token limited to Actions on this repository.
+
+## Update 16: when the phone cannot reach raw.githubusercontent.com
+* Screenshots (Nov 11) showed "Failed host lookup: raw.githubusercontent.com" and "Connection reset by peer": the phone's network could not reach GitHub's file server, so the feed, the bot record and the experiments stayed hours old and Focus could not be checked.
+* All GitHub files (feed, bot paper log, experiment files) now go through one helper: raw.githubusercontent.com first; if that fails, the same file through the GitHub API (api.github.com/repos/.../contents/...?ref=branch, raw media type). The API allows 60 requests an hour without login, so each file is read that way at most every 2 minutes and the last copy is reused in between; after a failure raw is skipped for 5 minutes.
+* The bot record is saved on the phone after every successful load, so Focus keeps working from the saved copy when GitHub cannot be reached. The Signals card says when it uses the saved copy, and says clearly when Focus cannot be checked (then all signals are shown).
+* Network errors are shown as a short message with what to try (mobile data, another Wi-Fi, Private DNS dns.google).
