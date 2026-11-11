@@ -39,7 +39,9 @@ EXCLUDE = {"USDC", "FDUSD", "TUSD", "DAI", "USDE", "BUSD", "USDP"}
 NEWS_NAME = "News headline"
 NEWS_MAX_AGE_MIN = 60
 NEWS_FEEDS = {"CoinDesk": "https://www.coindesk.com/arc/outboundfeeds/rss/", "Cointelegraph": "https://cointelegraph.com/rss",
-              "Decrypt": "https://decrypt.co/feed"}
+              "Decrypt": "https://decrypt.co/feed",
+              # backup: crypto news sites may block GitHub's servers (no News headline trade in the first 3 days)
+              "Google News": "https://news.google.com/rss/search?q=bitcoin+OR+ethereum+OR+crypto+when:1h&hl=en-US&gl=US&ceid=US:en"}
 BULL = ['surge', 'rally', 'soar', 'approve', 'inflow', 'adoption', 'rate cut', 'beats', 'record high', 'gains', 'bullish', 'jumps',
         'rebound', 'recovers', 'upgrade', 'breakout', 'etf approval']
 BEAR = ['crash', 'plunge', 'hack', 'exploit', 'ban ', 'lawsuit', 'sues', 'rate hike', 'liquidat', 'fears', 'selloff', 'sell-off',
@@ -132,13 +134,23 @@ def news_coins(title, coins):
 def news_signals(st, coins, now_ms, fetch=None):
     # coin -> +1 / -1 from new headlines (60 minutes or newer) that name it; several headlines on one coin are added up
     seen = dict.fromkeys(st.get("news_seen", []))
-    total, heads = {}, []
+    total, heads, feeds = {}, [], {}
     for src, url in NEWS_FEEDS.items():
         try:
-            body = fetch(url) if fetch else requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15).text
-        except Exception:
+            if fetch:
+                body = fetch(url)
+            else:
+                r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+                if r.status_code != 200:
+                    feeds[src] = f"HTTP {r.status_code}"
+                    continue
+                body = r.text
+        except Exception as e:
+            feeds[src] = f"error {type(e).__name__}"
             continue
-        for key, title, pub, sc in parse_rss(body, src):
+        items = parse_rss(body, src)
+        feeds[src] = f"{len(items)} items"
+        for key, title, pub, sc in items:
             tkey = "T|" + title.lower()                  # the same story on several sites counts once
             if key in seen or tkey in seen or now_ms - pub > NEWS_MAX_AGE_MIN * 60000 or pub > now_ms + 300000:
                 continue
@@ -150,6 +162,7 @@ def news_signals(st, coins, now_ms, fetch=None):
                 total[c] = total.get(c, 0) + sc
                 heads.append(title)
     st["news_seen"] = list(seen)[-800:]
+    st["news_feeds"] = feeds
     return {c: (1 if v > 0 else -1) for c, v in total.items() if v != 0}, heads
 
 
@@ -600,7 +613,7 @@ def main():
     stats = {d: v for d, v in stats.items() if d >= cutoff}
     st["coins"] = coins
     info = {"opened": opened, "errors": errors, "seconds": round(time.time() - t0, 1), "news_trades": news_opened,
-            "news_coins": sorted(nsig), "news_headlines": heads[:10]}
+            "news_coins": sorted(nsig), "news_headlines": heads[:10], "news_feeds": st.get("news_feeds", {})}
     save("exp_state.json", st)
     save("exp_stats.json", stats)
     save("exp_summary.json", summary(stats, st, coins, info))

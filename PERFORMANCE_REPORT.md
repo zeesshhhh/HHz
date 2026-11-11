@@ -203,3 +203,10 @@ Walk-forward test on 2,201 closed GitHub bot trades (Oct 30 - Nov 9), using only
 | + trend | 6,489 | -806 | -0.124 | -185 | -621 |
   Every indicator lost in both versions, and SELL lost too on those days. The trend filter cuts trades by two thirds but does not turn the signals profitable. The SELL profits of Nov 10 came from one falling day.
 * The only result so far that held up when tested on data it was not built from is the bot focus rule (walk-forward +81.4R over 630 trades; app copies +5.25R over the first 5).
+
+## Update 14: logs of Nov 11
+* **Bot focus rule on outcomes not seen when it was built** (bot trades that closed after Nov 9 18:06): focus 64 trades, 64% wins, +54.5R, PF 3.26; non-focus 54 trades, 63% wins, +38.7R, PF 2.84. Almost all SELL in a falling market, so most of the gain is the market; focus still did better per trade (+0.85R vs +0.72R). Cloud Bot focus account: 694 closed, +133.0R.
+* **App indicator auto trades** ("App auto", trade source set to App indicators or Both): 139 closed, 24.5% wins, -77.5R (104 stops, 34 targets), all opened in one evening (Nov 10 18:00-24:00 UTC), both directions, every timeframe. App copies of bot focus signals: 6 closed, +5.07R.
+* **Experiment lab, 3 days (25,373 trades)**: -3,208R at 1:1. Best: Stochastic SELL +57.4R / 313 (positive 2 of 3 days), CCI reversal SELL +32.8R, Z-score SELL +31.0R; all mean-reversion SELL lost on Nov 11 so far. "+ trend" versions lost more than the plain ones (CCI + trend SELL -67.0R, RSI 2 + trend SELL -61.2R), in line with the 8-day check: the trend filter does not help.
+* **App Lab**: plain SELL +128.7R over 610, plain BUY 0.0R over 1,276, "+ trend" SELL -21.5R over 118.
+* **News**: app traded one headline (BTC SELL on 6 timeframes, 1 closed at TP +0.95R); the keyword score read "resume withdrawals after $49M hack" as bearish. The cloud News headline experiment opened no trade in 3 days. Change: the lab now records each news feed's status (items or HTTP error) and adds Google News as a backup feed; the Experiments tab and experiments_last_run.json in the logs ZIP show it.
