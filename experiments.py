@@ -84,11 +84,16 @@ def top_coins(n):
 
 
 def candles(coin, tf):
-    """Last 300 candles, oldest first, with a 'closed' flag (OKX 'confirm')."""
+    """Last 600 candles (two pages), oldest first, with a 'closed' flag (OKX 'confirm')."""
     rows = okx("/market/candles", {"instId": f"{coin}-USDT-SWAP", "bar": BAR[tf], "limit": "300"})
     time.sleep(0.12)                                     # well inside OKX's 40 requests / 2 s
     if not rows:
         return None
+    if len(rows) >= 300:                                 # second page (older candles), so long gaps between runs lose nothing
+        more = okx("/market/candles", {"instId": f"{coin}-USDT-SWAP", "bar": BAR[tf], "limit": "300",
+                                       "after": str(min(int(x[0]) for x in rows))}, tries=1)
+        time.sleep(0.12)
+        rows = rows + [x for x in more if int(x[0]) < min(int(y[0]) for y in rows)]
     df = pd.DataFrame([[x[0], x[1], x[2], x[3], x[4], x[5], x[8] if len(x) > 8 else "1"] for x in rows],
                       columns=["ts", "open", "high", "low", "close", "volume", "confirm"])
     df["ts"] = df["ts"].astype("int64")
@@ -419,6 +424,151 @@ def indicators(df):
     return out, a14
 
 
+# ---------------------------------------------------------------- app Lab rules, run 24/7
+# Exact copy of the phone app's Lab (main.dart: analyze + evalSnap), so its 10 indicators are tested around the clock
+# instead of only while the app is open. Differences from the experiments above, on purpose:
+#   * a signal counts on EVERY closed candle while the indicator is in its zone (not only when it starts)
+#   * entry at the signal candle's close, target and stop 1.5 ATR(14), judged over the next 6 candles
+#   * neither hit (or both in one candle): closed at the 6th candle's close, capped at +/-1R; fee 0.05R
+#   * "+ trend": BUY only while the close is above EMA 200, SELL only while below
+LAB_H = 6
+LAB_ATR = 1.5
+LAB_MIN_BARS = 200
+
+
+def zone(x, lo, hi):
+    return np.where(x < lo, 1, np.where(x > hi, -1, 0))
+
+
+def lab_states(df):
+    """App Lab indicator -> +1 / -1 / 0 for every candle, plus EMA 200 side and ATR(14)."""
+    o, h, l, c, v = (df[k].values for k in ("open", "high", "low", "close", "volume"))
+    n = len(c)
+    r14, r2 = rsi(c, 14), rsi(c, 2)
+    hh14, ll14 = hh(h, 14), ll(l, 14)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        k = np.where(hh14 == ll14, 50.0, 100 * (c - ll14) / (hh14 - ll14))                 # raw %K, as in the app
+        tp = (h + l + c) / 3
+        sm = sma(tp, 20)
+        md = pd.Series(tp).rolling(20).apply(lambda a: np.mean(np.abs(a - a.mean())), raw=True).values
+        cci = np.where(md == 0, 0.0, (tp - sm) / (0.015 * md))
+        mid = sma(c, 20)
+        sd = pd.Series(c).rolling(20).std(ddof=0).values                                   # population sd, as in the app
+        pb = np.where(sd == 0, 0.5, (c - (mid - 2 * sd)) / (4 * sd))
+        z = np.where(sd > 0, (c - mid) / sd, 0.0)
+        raw = tp * v
+        pos = pd.Series(np.where(tp > prev(tp), raw, 0.0)).rolling(14).sum().values
+        neg = pd.Series(np.where(tp < prev(tp), raw, 0.0)).rolling(14).sum().values
+        mfi = np.where(neg == 0, 100.0, 100 - 100 / (1 + pos / neg))
+        rh, rl = hh(r14, 14), ll(r14, 14)
+        sraw = np.where(rh == rl, 50.0, 100 * (r14 - rl) / (rh - rl))
+        srsi = sma(sraw, 3)
+        pc = prev(c)
+        bp = c - np.minimum(l, pc)
+        tr = np.maximum(h, pc) - np.minimum(l, pc)
+        rs = lambda a, m: pd.Series(a).rolling(m).sum().values
+        av = lambda m: np.where(rs(tr, m) == 0, 0.5, rs(bp, m) / rs(tr, m))
+        uo = 100 * (4 * av(7) + 2 * av(14) + av(28)) / 7
+    a14 = atr(h, l, c, 14)
+    # candle pattern, same order of checks as the app
+    body, rg = np.abs(c - o), h - l
+    upw, low = h - np.maximum(c, o), np.minimum(c, o) - l
+    o1, c1, o2, c2 = prev(o), prev(c), prev(prev(o)), prev(prev(c))
+    pbody, big = np.abs(c1 - o1), np.abs(c2 - o2)
+    with np.errstate(invalid="ignore"):
+        morning = (c2 < o2) & (big > a14 * 0.6) & (pbody < big * 0.4) & (c > o) & (c > (c2 + o2) / 2)
+        evening = (c2 > o2) & (big > a14 * 0.6) & (pbody < big * 0.4) & (c < o) & (c < (c2 + o2) / 2)
+        bull = (c1 < o1) & (c > o) & (c >= o1) & (o <= c1) & (body > pbody)
+        bear = (c1 > o1) & (c < o) & (c <= o1) & (o >= c1) & (body > pbody)
+        hammer = (rg > 0) & (body > 0) & (low > 2 * body) & (upw < 0.25 * rg)
+        star = (rg > 0) & (body > 0) & (upw > 2 * body) & (low < 0.25 * rg)
+    cp = np.select([morning, evening, bull, bear, hammer, star], [1, -1, 1, -1, 1, -1], 0)
+    cp[:3] = 0
+    ok = lambda x: np.nan_to_num(x, nan=0).astype(int)
+    states = {
+        "RSI (2)": zone(r2, 10, 90), "RSI (14)": zone(r14, 30, 70), "CCI (20)": zone(cci, -100, 100),
+        "Stochastic (14,3)": ok(np.where(np.isnan(hh14), 0, zone(k, 20, 80))),
+        "Stochastic RSI": ok(np.where(np.isnan(srsi), 0, zone(srsi, 20, 80))),
+        "MFI (14)": ok(np.where(np.isnan(pos + neg), 0, zone(mfi, 20, 80))),
+        "Bollinger %B (20,2)": ok(np.where(np.isnan(sd), 0, zone(pb, 0.05, 0.95))),
+        "Z-score (20)": ok(np.where(np.isnan(sd), 0, zone(z, -2, 2))),
+        "Ultimate Oscillator": ok(np.where(np.isnan(uo), 0, zone(uo, 30, 70))),
+        "Candle pattern": cp.astype(int),
+    }
+    states["CCI (20)"] = ok(np.where(np.isnan(md), 0, states["CCI (20)"]))
+    e200 = ema(c, 200)
+    trend = np.where(c > e200, 1, -1)
+    return states, trend, a14
+
+
+def lab_r(side, race, move):
+    if race == side:
+        return 1 - FEE
+    if race == -side:
+        return -1 - FEE
+    return min(max(move * side / LAB_ATR, -1.0), 1.0) - FEE
+
+
+def lab_eval(i, hi, lo, c, a):
+    """Race of candle i's signal over the next LAB_H candles: +1 upper level first, -1 lower first, 0 neither / both."""
+    up, dn = c[i] + LAB_ATR * a, c[i] - LAB_ATR * a
+    race = 0
+    for j in range(i + 1, i + LAB_H + 1):
+        hu, hd = hi[j] >= up, lo[j] <= dn
+        if hu or hd:
+            race = 0 if (hu and hd) else (1 if hu else -1)
+            break
+    return race, (c[i + LAB_H] - c[i]) / a
+
+
+def lab_process(coin, tf, df, st, stats):
+    """Score every app-Lab signal whose 6 candles have closed. First run: every candle with 200+ candles of history."""
+    if df is None:
+        return 0
+    cl = df[df["closed"]].reset_index(drop=True)
+    n = len(cl)
+    if n < LAB_MIN_BARS + LAB_H + 2:
+        return 0
+    key = f"{coin}|{tf}"
+    done = st.setdefault("lab_last", {}).get(key)
+    ts = cl["ts"].values
+    idx = [i for i in range(LAB_MIN_BARS, n - LAB_H) if done is None or ts[i] > done]
+    if not idx:
+        return 0
+    states, trend, a14 = lab_states(cl)
+    hi, lo, c = cl["high"].values, cl["low"].values, cl["close"].values
+    count = 0
+    for i in idx:
+        a = a14[i]
+        if np.isnan(a) or a <= 0:
+            continue
+        race = move = None
+        for name, arr in states.items():
+            side = int(arr[i])
+            if side == 0:
+                continue
+            if race is None:
+                race, move = lab_eval(i, hi, lo, c, a)
+            r = round(lab_r(side, race, move), 3)
+            day = datetime.fromtimestamp(int(ts[i + 1]) / 1000, timezone.utc).strftime("%Y-%m-%d")
+            sd = "BUY" if side == 1 else "SELL"
+            names = [name] + ([name + TREND_SUFFIX] if trend[i] == side else [])
+            bucket = stats.setdefault(day, {})
+            for nm in names:
+                for k in (f"L|{nm}|{sd}", f"l|{nm}|{tf}|{sd}"):
+                    row = bucket.setdefault(k, [0, 0, 0.0, 0.0, 0, 0.0, 0.0])
+                    row[0] += 1
+                    for j in (1, 4):                       # one result per signal: shown under both target columns
+                        if r > 0:
+                            row[j] += 1
+                        else:
+                            row[j + 2] = round(row[j + 2] - r, 3)
+                        row[j + 1] = round(row[j + 1] + r, 3)
+                count += 1
+    st["lab_last"][key] = int(ts[idx[-1]])
+    return count
+
+
 # ---------------------------------------------------------------- trades
 def step(tr, hi, lo, cl, hold):
     """Advance one open trade by one closed candle. Both targets share the stop. Stop first if both touch in one candle."""
@@ -591,7 +741,7 @@ def main():
     except Exception as e:
         nsig, heads = {}, []
         print(f"news: {e}")
-    news_opened = 0
+    news_opened = lab_scored = 0
     for coin in follow:
         for tf in TFS:
             in_top = coin in coins
@@ -602,6 +752,8 @@ def main():
                 if not in_top and df is not None and df["closed"].any():
                     st["last"][f"{coin}|{tf}"] = int(df.loc[df["closed"], "ts"].max())   # resolve only, no new trades
                 opened += process(coin, tf, df, st, stats)
+                if in_top:
+                    lab_scored += lab_process(coin, tf, df, st, stats)
                 if in_top and coin in nsig:
                     k = open_news(coin, tf, df, st, nsig[coin])
                     opened += k
@@ -612,7 +764,7 @@ def main():
     cutoff = (pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=KEEP_DAYS)).strftime("%Y-%m-%d")
     stats = {d: v for d, v in stats.items() if d >= cutoff}
     st["coins"] = coins
-    info = {"opened": opened, "errors": errors, "seconds": round(time.time() - t0, 1), "news_trades": news_opened,
+    info = {"opened": opened, "errors": errors, "seconds": round(time.time() - t0, 1), "news_trades": news_opened, "lab_signals_scored": lab_scored,
             "news_coins": sorted(nsig), "news_headlines": heads[:10], "news_feeds": st.get("news_feeds", {})}
     save("exp_state.json", st)
     save("exp_stats.json", stats)
