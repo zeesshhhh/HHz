@@ -2616,6 +2616,7 @@ class _HomeState extends State<Home> {
       final p = k.split('|');
       switch (p[0]) {
         case 'i': return '${p[1]} ${p[3]} (${p[2]})';
+        case 'l': return '${p[1]} ${p[3]} (${p[2]})';
         case 'ic': return '${p[1]} ${p[2]} on ${p[3]}';
         default: return p.length >= 3 ? '${p[1]} ${p[2]}' : k;
       }
@@ -2625,7 +2626,7 @@ class _HomeState extends State<Home> {
       final a = v(k);
       if (a[0] < expMinN) return false;
       if (expProvenOnly && !proven(a)) return false;
-      if (expTf != 'All' && (expView == 'i' || expView == 't') && k.split('|')[expView == 'i' ? 2 : 1] != expTf) return false;
+      if (expTf != 'All' && (expView == 'i' || expView == 'l' || expView == 't') && k.split('|')[expView == 't' ? 1 : 2] != expTf) return false;
       return true;
     }).toList()
       ..sort((x, y) => expWorst ? v(x)[2 + o].compareTo(v(y)[2 + o]) : v(y)[2 + o].compareTo(v(x)[2 + o]));
@@ -2658,11 +2659,7 @@ class _HomeState extends State<Home> {
                     style: const TextStyle(fontSize: 11));
               }),
               const SizedBox(height: 4),
-              ElevatedButton.icon(
-                onPressed: allLogsBusy ? null : downloadAllLogsZip,
-                icon: const Icon(Icons.download_for_offline),
-                label: Text(allLogsBusy ? 'Collecting logs...' : 'Download all logs (one ZIP)'),
-              ),
+              zipButton(),
               Text('Every indicator opens a virtual trade on each new signal, on every coin and timeframe, entering at the next candle. '
                   '"News headline" trades each new coin headline from CoinDesk, Cointelegraph and Decrypt on all timeframes at the current price. '
                   'Each trade is followed to a 1:1 and a 1:2 target (stop 1.5 ATR, 0.05R fee). PROVEN = $minN+ trades, profit factor above 1.1 '
@@ -2672,7 +2669,8 @@ class _HomeState extends State<Home> {
           ),
         ),
         Wrap(spacing: 6, children: [
-          for (final e in const {'Indicators': 'I', 'Indicator + timeframe': 'i', 'Coins': 'c', 'Indicator + coin': 'ic', 'Timeframes': 't'}.entries)
+          for (final e in const {'Indicators': 'I', 'Indicator + timeframe': 'i', 'Coins': 'c', 'Indicator + coin': 'ic', 'Timeframes': 't',
+            'App Lab rules': 'L', 'App Lab rules + timeframe': 'l'}.entries)
             ChoiceChip(label: Text(e.key), selected: expView == e.value, onSelected: (_) => setState(() => expView = e.value)),
         ]),
         Wrap(spacing: 6, children: [
@@ -2684,7 +2682,14 @@ class _HomeState extends State<Home> {
         Wrap(spacing: 6, children: [
           for (final n in const [1, 20, 50, 100]) ChoiceChip(label: Text('$n+ trades'), selected: expMinN == n, onSelected: (_) => setState(() => expMinN = n)),
         ]),
-        if (expView == 'i' || expView == 't')
+        if (expView == 'L' || expView == 'l')
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 4),
+            child: Text('App Lab rules: the same 10 indicators and scoring as the Lab tab, but run on GitHub 24/7. A signal counts on every candle '
+                'while the indicator is in its zone; entry at that candle\'s close, target and stop 1.5 ATR, judged over 6 candles, 0.05R fee. '
+                'One result per signal, so Target 1:1 and 1:2 show the same number here.', style: TextStyle(fontSize: 11)),
+          ),
+        if (expView == 'i' || expView == 'l' || expView == 't')
           Wrap(spacing: 6, children: [
             for (final t in ['All', ...tfs]) ChoiceChip(label: Text(t), selected: expTf == t, onSelected: (_) => setState(() => expTf = t)),
           ]),
@@ -4331,6 +4336,13 @@ class _HomeState extends State<Home> {
     );
   }
 
+  /// The only download in the app: every log in one ZIP file.
+  Widget zipButton() => ElevatedButton.icon(
+        onPressed: allLogsBusy ? null : downloadAllLogsZip,
+        icon: const Icon(Icons.download_for_offline),
+        label: Text(allLogsBusy ? 'Collecting logs...' : 'Download all logs (one ZIP)'),
+      );
+
   /// Every log in one ZIP file: app trades, profit analysis, bot log, bot focus account, Lab, news and Experiment lab.
   Future<void> downloadAllLogsZip() async {
     if (allLogsBusy) return;
@@ -4439,13 +4451,14 @@ class _HomeState extends State<Home> {
     final lines = ['view,name,timeframe,side,coin,n,win_pct_1to1,R_1to1,pf_1to1,R_1to1_older_half,R_1to1_newer_half,'
         'win_pct_1to2,R_1to2,pf_1to2,R_1to2_older_half,R_1to2_newer_half'];
     final rows = (d['rows'] as Map? ?? {}).cast<String, dynamic>();
-    const views = {'all': 'All', 'I': 'Indicator', 'i': 'Indicator + timeframe', 'c': 'Coin', 't': 'Timeframe', 'ic': 'Indicator + coin'};
+    const views = {'all': 'All', 'I': 'Indicator', 'i': 'Indicator + timeframe', 'c': 'Coin', 't': 'Timeframe', 'ic': 'Indicator + coin',
+      'L': 'App Lab rules', 'l': 'App Lab rules + timeframe'};
     for (final e in rows.entries) {
       final p = e.key.split('|');
       final v = p[0];
       String name = '', tf = '', side = '', coin = '';
-      if (v == 'I') { name = p[1]; side = p[2]; }
-      if (v == 'i') { name = p[1]; tf = p[2]; side = p[3]; }
+      if (v == 'I' || v == 'L') { name = p[1]; side = p[2]; }
+      if (v == 'i' || v == 'l') { name = p[1]; tf = p[2]; side = p[3]; }
       if (v == 'c') { coin = p[1]; side = p[2]; }
       if (v == 't') { tf = p[1]; side = p[2]; }
       if (v == 'ic') { name = p[1]; side = p[2]; coin = p[3]; }
@@ -4738,14 +4751,9 @@ class _HomeState extends State<Home> {
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
           const Text('Paper trading log', style: TextStyle(fontWeight: FontWeight.w700)),
           const SizedBox(height: 4),
-          const Text('Every virtual trade as a CSV file: entry, stop, target, exit and reason, result in R, best and worst move after entry, plus ADX, RSI, news mood, 4h trend, hour and weekday at the time of the signal. Send it to tune the bot.', style: TextStyle(fontSize: 12)),
+          const Text('The bot\'s paper trades are part of the one ZIP with all logs (bot_paper_log.csv and bot_focus_account.csv).', style: TextStyle(fontSize: 12)),
           const SizedBox(height: 8),
-          Wrap(spacing: 8, children: [
-            ElevatedButton.icon(onPressed: downloadBotLog, icon: const Icon(Icons.download), label: const Text('Download CSV')),
-            OutlinedButton.icon(onPressed: copyLog, icon: const Icon(Icons.copy), label: const Text('Copy to clipboard')),
-          ]),
-          const SizedBox(height: 6),
-          const Text('Also available in your GitHub repo at docs/paper_log.csv (open the file, then Download raw file).', style: TextStyle(fontSize: 11)),
+          zipButton(),
         ]),
       ),
     );
@@ -5363,20 +5371,11 @@ class _HomeState extends State<Home> {
         child: Padding(
           padding: const EdgeInsets.all(14),
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Text('Download logs to tune the bot', style: TextStyle(fontWeight: FontWeight.w700)),
+            const Text('Download all logs', style: TextStyle(fontWeight: FontWeight.w700)),
             const SizedBox(height: 4),
-            const Text('In-app log: every trade with entry, stop, target, exit and reason, result in R, best and worst move after entry, verdict, score, indicator counts, ADX, ATR %, news mood, hour and weekday. The bot log uses the same column names, so you can compare them.', style: TextStyle(fontSize: 12)),
+            const Text('One ZIP file with everything: app trades, profit analysis, trade indicators, news trades and headlines, the bot log and bot focus account, the Lab files and the Experiment lab files.', style: TextStyle(fontSize: 12)),
             const SizedBox(height: 8),
-            Wrap(spacing: 8, children: [
-              ElevatedButton.icon(onPressed: downloadAppLog, icon: const Icon(Icons.download), label: const Text('Download app log')),
-              ElevatedButton.icon(onPressed: downloadProfitLog, icon: const Icon(Icons.insights), label: const Text('Download profit analysis')),
-              OutlinedButton.icon(onPressed: shareDetailLogs, icon: const Icon(Icons.share), label: const Text('Share detail logs')),
-              OutlinedButton.icon(onPressed: copyAppLog, icon: const Icon(Icons.copy), label: const Text('Copy')),
-              OutlinedButton.icon(onPressed: downloadBotLog, icon: const Icon(Icons.download), label: const Text('Download bot log')),
-              OutlinedButton.icon(onPressed: downloadAllLogs, icon: const Icon(Icons.download_for_offline), label: const Text('Download all logs (one ZIP)')),
-            ]),
-            const SizedBox(height: 6),
-            const Text('Profit analysis: one row per coin, timeframe, indicator, side, hour and regime with trades, win rate, net R, profit factor and a PROFITABLE / losing label (rows under 10 trades say "too few trades"). Detail logs also include one row per trade and agreeing indicator for pivot tables.', style: TextStyle(fontSize: 11)),
+            zipButton(),
             const SizedBox(height: 6),
             Align(alignment: Alignment.centerRight, child: TextButton.icon(onPressed: trades.isEmpty ? null : resetPaper, icon: const Icon(Icons.delete_outline), label: const Text('Reset in-app paper account'))),
           ]),
@@ -5472,11 +5471,6 @@ class _HomeState extends State<Home> {
             child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
               Row(children: [
                 Expanded(child: Text('$sel: all trades', style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15))),
-                IconButton(
-                  tooltip: 'Download these trades',
-                  icon: const Icon(Icons.download),
-                  onPressed: list.isEmpty ? null : () => downloadCsv('lab_trades_${sel.replaceAll(RegExp(r'[^A-Za-z0-9]+'), '_')}.csv', labTradesCsv(list)),
-                ),
               ]),
               for (final g in [
                 {'title': 'By direction', 'm': splitBy((x) => x.side == 1 ? 'BUY' : 'SELL')},
@@ -5513,16 +5507,11 @@ class _HomeState extends State<Home> {
         child: Padding(
           padding: const EdgeInsets.all(14),
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            const Text('Download Lab data', style: TextStyle(fontWeight: FontWeight.w700)),
+            const Text('Download all logs', style: TextStyle(fontWeight: FontWeight.w700)),
             const SizedBox(height: 4),
-            const Text('Accuracy table: one row per indicator and style. Snapshots: what the Lab indicators said at each signal and what happened next (last 6,000). '
-                'The download button on an indicator gives its trades.', style: TextStyle(fontSize: 12)),
+            const Text('The Lab accuracy table, snapshots and every Lab trade are inside the one ZIP with all logs.', style: TextStyle(fontSize: 12)),
             const SizedBox(height: 8),
-            Wrap(spacing: 8, children: [
-              ElevatedButton.icon(onPressed: downloadLabAcc, icon: const Icon(Icons.download), label: const Text('Download accuracy table')),
-              OutlinedButton.icon(onPressed: downloadLabRows, icon: const Icon(Icons.download), label: const Text('Download raw snapshots')),
-              OutlinedButton.icon(onPressed: downloadAllLogs, icon: const Icon(Icons.download_for_offline), label: const Text('Download all logs (one ZIP)')),
-            ]),
+            zipButton(),
             Align(alignment: Alignment.centerRight, child: TextButton.icon(onPressed: resetLab, icon: const Icon(Icons.delete_outline), label: const Text('Reset Lab'))),
           ]),
         ),
