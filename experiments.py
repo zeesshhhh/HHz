@@ -109,8 +109,18 @@ def unescape(t):
     return t.strip()
 
 
-def score_title(t):
+def news_head(t):
+    # words after "after", "despite" or "following" are background, not the news itself
     x = f" {t.lower()} "
+    for w in (" after ", " despite ", " following "):
+        i = x.find(w)
+        if i > 0:
+            x = x[:i] + " "
+    return x
+
+
+def score_title(t):
+    x = news_head(t)
     return sum(w in x for w in BULL) - sum(w in x for w in BEAR)
 
 

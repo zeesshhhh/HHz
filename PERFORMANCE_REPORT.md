@@ -231,3 +231,14 @@ Walk-forward test on 2,201 closed GitHub bot trades (Oct 30 - Nov 9), using only
 
 ## Update 18: one download only
 * Every export button was replaced by a single "Download all logs (one ZIP)" button (Paper tab, bot log card, Lab tab, Experiments tab). Removed from the screens: Download app log, Download profit analysis, Share detail logs, Copy, Download bot log / Download CSV, Copy to clipboard, Download accuracy table, Download raw snapshots and the per-indicator download icon. All of that data is inside the ZIP.
+
+## Update 19: four small robustness fixes (no change to how signals are chosen or judged)
+* `main.yml`: if a push fails because someone uploaded a file during the run, the bot fetches that change and pushes again, so the run's trades are not lost. The 5-minute GitHub schedule is replaced by an hourly safety net, because cron-job.org now starts the scan every 5 minutes; daily and weekly report lines unchanged. `experiments.yml`: hourly safety net too.
+* `paper.py`: the bot no longer opens paper trades with a target or stop at or below zero, or a stop more than 20% from the entry (the AKE 4h case).
+* News scoring (app and Experiment lab): only the part of a headline before "after", "despite" or "following" is scored. "resume withdrawals after $49M hack" and "stocks rise despite US bond yield rebound" now score 0.
+
+## Update 20: fewer tabs and a chart-only Markets tab
+* Tabs removed: Account, Scanner, News. Remaining: Markets, Signals, Alerts, Paper, Lab, Report, Experiments. The "Auto paper trades from news" card moved to the Paper tab; headlines still load in the background for news trades.
+* Markets tab now shows only the chart: coin search and favourites, timeframe, price, a taller candlestick chart, the visible date range and buttons (older, newer, zoom in, zoom out, Latest). Indicator panel, multi-timeframe card, signal filter card and market sessions were removed from the screen.
+* The chart can be dragged left and right through the past. Older candles load automatically from Binance (500 at a time, up to about 6,000 per coin and timeframe). Forex, gold and oil from Yahoo show only the loaded range.
+* Tapping a paper trade (open or closed), a news trade, a bot signal or a Lab trade opens that coin and timeframe, scrolls to the time of the entry and draws Entry, SL and TP (and Exit for closed paper trades).

@@ -138,6 +138,9 @@ def open_pos(p, symbol, s):
         return False
     if side == -1 and not (tp < entry < sl):
         return False
+    # Broken plans (seen Nov 10: AKE 4h SELL with the stop 79% away and the target below zero) are not traded.
+    if tp <= 0 or sl <= 0 or abs(entry - sl) / entry > 0.20:
+        return False
     if any(o.get("symbol") == symbol and o.get("strategy") == s.get("strategy") for o in p["open"]):
         return False
     if PAPER_MAX_OPEN is not None and len(p["open"]) >= PAPER_MAX_OPEN:
