@@ -777,6 +777,23 @@ Analysis analyze(List<Candle> cs, int d) {
   return Analysis(ma, osc, info, b, s, z, last, atr, adxV, score, sups.take(3).toList(), ress.take(3).toList());
 }
 
+/// Up to 500 candles that end before [before] (Binance coins only), for scrolling the chart into the past.
+Future<List<Candle>> fetchOlderCandles(String sym, String tf, DateTime before) async {
+  if (yahooPairs.containsKey(sym)) return <Candle>[];
+  final pair = futSymbols[sym] ?? '${sym}USDT';
+  final q = {'symbol': pair, 'interval': tf, 'limit': '500', 'endTime': '${before.millisecondsSinceEpoch - 1}'};
+  var r = await http.get(Uri.https('fapi.binance.com', '/fapi/v1/klines', q)).timeout(const Duration(seconds: 15));
+  if (r.statusCode != 200) {
+    r = await http.get(Uri.https('api.binance.com', '/api/v3/klines', q)).timeout(const Duration(seconds: 15));
+  }
+  if (r.statusCode != 200) throw 'Older candles unavailable (HTTP ${r.statusCode}).';
+  return (jsonDecode(r.body) as List)
+      .map((x) => Candle(DateTime.fromMillisecondsSinceEpoch((x[0] as num).toInt()), double.parse('${x[1]}'),
+          double.parse('${x[2]}'), double.parse('${x[3]}'), double.parse('${x[4]}'), double.parse('${x[5]}')))
+      .where((c) => c.time.isBefore(before))
+      .toList();
+}
+
 Future<List<Candle>> fetchCandles(String sym, String tf) async {
   if (!yahooPairs.containsKey(sym)) {
     final pair = futSymbols[sym] ?? '${sym}USDT';
@@ -936,8 +953,19 @@ class EconEvent {
   EconEvent(this.title, this.country, this.time, this.forecast, this.previous);
 }
 
+/// Words after "after", "despite" or "following" describe the background, not the news itself
+/// ("withdrawals resume after $49M hack" is not bearish), so only the part before them is scored.
+String newsHead(String t) {
+  var x = ' ${t.toLowerCase()} ';
+  for (final w in const [' after ', ' despite ', ' following ']) {
+    final i = x.indexOf(w);
+    if (i > 0) x = '${x.substring(0, i)} ';
+  }
+  return x;
+}
+
 int scoreTitle(String t) {
-  final x = ' ${t.toLowerCase()} ';
+  final x = newsHead(t);
   var sc = 0;
   for (final w in bullWords) {
     if (x.contains(w)) sc++;
@@ -1925,6 +1953,16 @@ class _HomeState extends State<Home> {
   String filter = 'All';
   Timer? timer;
   Timer? marketTimer;
+  final Map<String, List<Candle>> chartOlder = {};   // candles older than the live 300, loaded while scrolling back
+  final Set<String> chartNoMore = {};                // coin|timeframe with no older history left
+  double chartOffset = 0;                             // candles between the right edge of the chart and the newest candle
+  int chartCount = 80;                                // candles on screen
+  String chartKey = '';
+  bool chartBusy = false;
+  AppTrade? chartTrade;                               // trade whose entry, stop and target are drawn (open or closed)
+  List<ChartMark> chartExtra = [];                    // levels of a tapped bot signal or Lab trade
+  String chartExtraCoin = '';
+  DateTime? chartJump;                                // time to bring into view after loading
   String marketSymbol = 'BTC';
   String marketInterval = '1m';
   String marketSignalFilter = 'All';
@@ -3488,14 +3526,21 @@ class _HomeState extends State<Home> {
 
   /// Marks of the selected open paper trade for the Markets chart (only while that coin is shown).
   List<ChartMark> focusMarks() {
-    final t = focusTrade;
-    if (t == null || !t.isOpen || t.coin != marketSymbol) return const [];
-    return [ChartMark('Entry', t.entry, Colors.blue), ChartMark('SL', t.sl, Colors.red), ChartMark('TP', t.tp, Colors.green)];
+    if (chartExtra.isNotEmpty && chartExtraCoin == marketSymbol) return chartExtra;
+    final t = chartTrade ?? focusTrade;
+    if (t == null || t.coin != marketSymbol) return const [];
+    return [
+      ChartMark('Entry', t.entry, Colors.blue), ChartMark('SL', t.sl, Colors.red), ChartMark('TP', t.tp, Colors.green),
+      if (!t.isOpen && t.exitPx > 0) ChartMark('Exit', t.exitPx, Colors.orange),
+    ];
   }
 
   /// Tapping a trade in the Paper tab opens its coin and timeframe in Markets and draws its entry, stop and target.
   void openTrade(AppTrade t, BuildContext ctx) {
     focusTrade = t.isOpen ? t : null;
+    chartExtra = [];
+    chartTrade = t;
+    chartJump = t.opened;
     openCoin(t.coin, t.tf, ctx);
   }
 
@@ -3560,10 +3605,29 @@ class _HomeState extends State<Home> {
     toast('${t.coin} closed by you: ${usd >= 0 ? '+' : ''}${usd.toStringAsFixed(2)} \$ (${r >= 0 ? '+' : ''}${r.toStringAsFixed(2)}R).');
   }
 
+  /// Tapping a bot signal or a Lab trade: show that coin's chart at that time with its entry, stop and target.
+  void openLevels(String coin, String tf, DateTime at, double entry, double sl, double tp, BuildContext ctx) {
+    chartTrade = null;
+    focusTrade = null;
+    chartExtraCoin = coin;
+    chartExtra = [ChartMark('Entry', entry, Colors.blue), ChartMark('SL', sl, Colors.red), ChartMark('TP', tp, Colors.green)];
+    chartJump = at;
+    openCoin(coin, tfList.contains(tf) ? tf : marketInterval, ctx);
+  }
+
+  void openSignal(Map<String, dynamic> s, BuildContext ctx) {
+    final coin = botCoin('${s['symbol']}');
+    final e = (s['entry'] as num?)?.toDouble(), sl = (s['sl'] as num?)?.toDouble(), tp = (s['tp'] as num?)?.toDouble();
+    if (coin == null || e == null || sl == null || tp == null) {
+      toast('No chart for ${s['symbol']} (not a Binance coin).');
+      return;
+    }
+    openLevels(coin, '${s['tf']}', DateTime.tryParse('${s['time']}')?.toLocal() ?? DateTime.now(), e, sl, tp, ctx);
+  }
+
   void openCoin(String coin, String tf, BuildContext ctx) {
     setState(() { marketSymbol = coin; marketInterval = tf; mtf = {}; });
-    loadMarket();
-    loadMtf();
+    loadMarket().then((_) => showChartTime());
     DefaultTabController.of(ctx).animateTo(0);
   }
 
@@ -3606,7 +3670,7 @@ class _HomeState extends State<Home> {
       }),
     );
     if (choice != null) {
-      setState(() { marketSymbol = choice; mtf = {}; });
+      setState(() { marketSymbol = choice; mtf = {}; chartTrade = null; chartExtra = []; });
       loadMarket();
       loadMtf();
     }
@@ -3818,52 +3882,120 @@ class _HomeState extends State<Home> {
     if (mounted) setState(() => loading = false);
   }
 
+  /// Live candles plus the older ones loaded while scrolling back.
+  List<Candle> chartCandles() {
+    final key = '$marketSymbol|$marketInterval';
+    final live = candles[key] ?? <Candle>[];
+    final old = chartOlder[key] ?? const <Candle>[];
+    if (live.isEmpty || old.isEmpty) return live;
+    return [...old.where((c) => c.time.isBefore(live.first.time)), ...live];
+  }
+
+  Future<void> loadOlderChart() async {
+    final key = '$marketSymbol|$marketInterval';
+    if (chartBusy || chartNoMore.contains(key)) return;
+    final all = chartCandles();
+    if (all.isEmpty) return;
+    chartBusy = true;
+    if (mounted) setState(() {});
+    try {
+      final more = await fetchOlderCandles(marketSymbol, marketInterval, all.first.time);
+      if (more.isEmpty) {
+        chartNoMore.add(key);
+      } else {
+        chartOlder[key] = [...more, ...(chartOlder[key] ?? const <Candle>[])];
+        if ((chartOlder[key]?.length ?? 0) > 6000) chartNoMore.add(key);       // enough history for a phone
+      }
+    } catch (_) {
+    } finally {
+      chartBusy = false;
+      if (mounted) setState(() {});
+    }
+  }
+
+  /// After a trade was tapped: load history back to its entry and scroll the chart there.
+  Future<void> showChartTime() async {
+    final t = chartJump;
+    if (t == null) return;
+    chartJump = null;
+    final key = '$marketSymbol|$marketInterval';
+    for (var i = 0; i < 8; i++) {
+      final all = chartCandles();
+      if (all.isEmpty || !all.first.time.isAfter(t) || chartNoMore.contains(key)) break;
+      await loadOlderChart();
+    }
+    final all = chartCandles();
+    if (all.isEmpty) return;
+    final after = all.where((c) => c.time.isAfter(t)).length;                    // candles since the entry
+    chartKey = key;
+    chartOffset = math.max(0, after - chartCount * 0.7).toDouble();             // entry at about one third from the left
+    if (mounted) setState(() {});
+  }
+
   Widget marketTab() {
-    final all = candles['$marketSymbol|$marketInterval'] ?? <Candle>[];
-    final list = all.takeLast(60);
-    final an = all.length >= 35 ? analyze(all, decimalsFor(marketSymbol, all.last.close)) : null;
+    final key = '$marketSymbol|$marketInterval';
+    if (key != chartKey) { chartKey = key; chartOffset = 0; }                    // new coin or timeframe: back to the newest candle
+    final all = chartCandles();
+    final count = math.min(chartCount, math.max(all.length, 1));
+    final maxOff = math.max(0, all.length - count).toDouble();
+    if (chartOffset > maxOff) chartOffset = maxOff;
+    final end = all.length - chartOffset.round();
+    final list = all.isEmpty ? <Candle>[] : all.sublist(math.max(0, end - count), end);
     final price = latestPrices[marketSymbol];
-    final pkt = DateTime.now().toUtc().add(const Duration(hours: 5));
-    String hm(int h, int m) => '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}';
-    final sessions = <Map<String, dynamic>>[
-      {'name':'Tokyo', 'start':5*60, 'end':14*60},
-      {'name':'London', 'start':13*60, 'end':22*60},
-      {'name':'New York Forex', 'start':17*60, 'end':2*60},
-      {'name':'US Stocks', 'start':18*60+30, 'end':1*60},
-    ];
-    final nowMin = pkt.hour*60 + pkt.minute;
-    bool isOpen(Map<String,dynamic> x) { final a=x['start'] as int, b=x['end'] as int; return a < b ? nowMin >= a && nowMin < b : nowMin >= a || nowMin < b; }
+    String when(DateTime t) => '${t.day.toString().padLeft(2, '0')}/${t.month.toString().padLeft(2, '0')}/${t.year % 100} ${hhmm(t)}';
+    void select(String coin) { setState(() { marketSymbol = coin; mtf = {}; chartTrade = null; chartExtra = []; }); loadMarket(); }
     return RefreshIndicator(onRefresh: loadMarket, child: ListView(physics: const AlwaysScrollableScrollPhysics(), padding: const EdgeInsets.all(12), children: [
       Wrap(spacing: 8, runSpacing: 4, children: [
-        ActionChip(avatar: const Icon(Icons.add_alert, size: 18), label: const Text('Set price alert'), onPressed: () => alertDialog()),
         ActionChip(avatar: const Icon(Icons.search, size: 18), label: Text(futSymbols.isEmpty ? 'All futures coins' : 'All coins (${futSymbols.length})'), onPressed: pickCoin),
-        for (final a in {...favorites, marketSymbol}) ChoiceChip(label: Text(a), selected: marketSymbol == a, onSelected: (_) { setState(() { marketSymbol = a; mtf = {}; }); loadMarket(); loadMtf(); }),
+        for (final a in {...favorites, marketSymbol}) ChoiceChip(label: Text(a), selected: marketSymbol == a, onSelected: (_) => select(a)),
       ]),
-      const SizedBox(height: 10),
-      Wrap(spacing: 8, children: [for (final tf in tfList) ChoiceChip(label: Text(tf), selected: marketInterval==tf, onSelected: (_) { setState(() => marketInterval=tf); loadMarket(); })]),
-      const SizedBox(height: 10),
+      const SizedBox(height: 8),
+      Wrap(spacing: 8, children: [for (final tf in tfList) ChoiceChip(label: Text(tf), selected: marketInterval == tf, onSelected: (_) { setState(() => marketInterval = tf); loadMarket(); })]),
+      const SizedBox(height: 8),
       focusBanner(),
-      Card(child: Padding(padding: const EdgeInsets.all(14), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text(marketSymbol, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-        Text(price == null ? 'Price unavailable' : '${fxPairs.contains(marketSymbol) ? '' : '\$'}${price.toStringAsFixed(decimalsFor(marketSymbol, price))}', style: const TextStyle(fontSize: 27, fontWeight: FontWeight.w700)),
-        Text('Free public data • Last update: ${marketUpdated == null ? 'not yet' : ago(marketUpdated!.toIso8601String())}'),
-        const SizedBox(height: 12),
-        if (marketLoading) const LinearProgressIndicator(),
+      Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Expanded(child: Text('$marketSymbol  $marketInterval', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold))),
+          Text(price == null ? '-' : '${fxPairs.contains(marketSymbol) ? '' : '\$'}${price.toStringAsFixed(decimalsFor(marketSymbol, price))}',
+              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w700)),
+        ]),
+        if (marketLoading || chartBusy) const LinearProgressIndicator(),
         if (marketError != null) Text(marketError!, style: const TextStyle(color: Colors.orange)),
-        if (list.length > 1) SizedBox(height: 260, child: CustomPaint(painter: CandlePainter(list, Theme.of(context).brightness==Brightness.dark, an?.sup ?? const <double>[], an?.res ?? const <double>[], focusMarks()), child: const SizedBox.expand())) else const SizedBox(height: 200, child: Center(child: Text('Waiting for candlestick data...'))),
-        const Text('Candles show open, high, low and close. Free APIs may delay or limit data.', style: TextStyle(fontSize: 11)),
-        const SizedBox(height: 14),
-        Text('Technical indicators', style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 8),
-        if (an != null) _indicatorPanel(an) else const Text('More candles are needed to calculate indicators.'),
-      ]))),
-      _mtfCard(),
-      _marketSignalFilterCard(),
-      Card(child: Padding(padding: const EdgeInsets.all(14), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Text('Market sessions • Pakistan time (UTC+5)', style: Theme.of(context).textTheme.titleMedium),
-        const SizedBox(height: 8),
-        for (final x in sessions) ListTile(contentPadding: EdgeInsets.zero, dense: true, title: Text(x['name'] as String), subtitle: Text('${hm((x['start'] as int) ~/ 60, (x['start'] as int)%60)} – ${hm((x['end'] as int) ~/ 60, (x['end'] as int)%60)} PKT'), trailing: Text(isOpen(x) ? 'OPEN' : 'CLOSED', style: TextStyle(fontWeight: FontWeight.bold, color: isOpen(x) ? Colors.green : Colors.grey))),
-        const Text('Indicative session hours only; holidays and daylight-saving changes may affect hours. Crypto trades 24/7.', style: TextStyle(fontSize: 11)),
+        const SizedBox(height: 6),
+        if (list.length > 1)
+          LayoutBuilder(builder: (ctx, box) {
+            final step = box.maxWidth / list.length;
+            return GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onHorizontalDragUpdate: (d) {
+                setState(() => chartOffset = (chartOffset + d.delta.dx / step).clamp(0.0, maxOff).toDouble());   // drag right = older candles
+                if (maxOff - chartOffset < 20) loadOlderChart();
+              },
+              child: SizedBox(
+                height: 420,
+                child: CustomPaint(
+                  painter: CandlePainter(list, Theme.of(context).brightness == Brightness.dark, const <double>[], const <double>[], focusMarks()),
+                  child: const SizedBox.expand(),
+                ),
+              ),
+            );
+          })
+        else
+          const SizedBox(height: 300, child: Center(child: Text('Waiting for candlestick data...'))),
+        if (list.length > 1)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Text('${when(list.first.time)}  to  ${when(list.last.time)}${chartOffset > 0 ? '   (past view)' : '   (live)'}', style: const TextStyle(fontSize: 12)),
+          ),
+        Wrap(spacing: 6, crossAxisAlignment: WrapCrossAlignment.center, children: [
+          IconButton(tooltip: 'Older', icon: const Icon(Icons.chevron_left), onPressed: () { setState(() => chartOffset = math.min(maxOff, chartOffset + count / 2)); if (maxOff - chartOffset < 20) loadOlderChart(); }),
+          IconButton(tooltip: 'Newer', icon: const Icon(Icons.chevron_right), onPressed: chartOffset <= 0 ? null : () => setState(() => chartOffset = math.max(0.0, chartOffset - count / 2))),
+          IconButton(tooltip: 'Fewer candles (zoom in)', icon: const Icon(Icons.zoom_in), onPressed: chartCount <= 30 ? null : () => setState(() => chartCount = math.max(30, chartCount * 2 ~/ 3))),
+          IconButton(tooltip: 'More candles (zoom out)', icon: const Icon(Icons.zoom_out), onPressed: chartCount >= 400 ? null : () => setState(() => chartCount = math.min(400, chartCount * 3 ~/ 2))),
+          TextButton(onPressed: chartOffset <= 0 ? null : () => setState(() => chartOffset = 0), child: const Text('Latest')),
+        ]),
+        Text('Drag the chart left or right to move through past candles. ${all.length} candles loaded'
+            '${chartNoMore.contains(key) ? ' (all available history).' : '; more load automatically as you go back.'}', style: const TextStyle(fontSize: 11)),
       ]))),
     ]));
   }
@@ -4648,7 +4780,7 @@ class _HomeState extends State<Home> {
       ),
       if (error != null) message(error!),
       if (list.isEmpty) message(sigFocusOnly && all.isNotEmpty ? 'No focus signal right now. Switch off "Show only focus signals" to see all ${all.length}.' : 'No signals yet. The bot posts here when a setup appears.'),
-      for (final s in list) signalCard(s),
+      for (final s in list) GestureDetector(onTap: () => openSignal(s, context), child: signalCard(s)),
     ]);
   }
 
@@ -5177,6 +5309,7 @@ class _HomeState extends State<Home> {
     }
     return ListView(physics: const AlwaysScrollableScrollPhysics(), padding: const EdgeInsets.all(12), children: [
       botFocusCard(),
+      newsTradesCard(),
       Card(
         child: Padding(
           padding: const EdgeInsets.all(14),
@@ -5366,7 +5499,7 @@ class _HomeState extends State<Home> {
           )),
         const Text('* stop and target were both touched in the same candle, counted as a stop.', style: TextStyle(fontSize: 11)),
       ],
-      if (trades.isEmpty) const Padding(padding: EdgeInsets.all(24), child: Text('No trades yet. Turn on Auto paper trading, or open a coin in Markets and tap Paper trade.', textAlign: TextAlign.center)),
+      if (trades.isEmpty) const Padding(padding: EdgeInsets.all(24), child: Text('No trades yet. Turn on Auto paper trading and trades will appear here.', textAlign: TextAlign.center)),
       Card(
         child: Padding(
           padding: const EdgeInsets.all(14),
@@ -5452,7 +5585,7 @@ class _HomeState extends State<Home> {
       Wrap(spacing: 8, children: [for (final x in styles) ChoiceChip(label: Text(x), selected: labStyle == x, onSelected: (_) => setState(() { labStyle = x; labShown = 50; }))]),
       Wrap(spacing: 8, children: [for (final x in const ['All', 'BUY', 'SELL']) ChoiceChip(label: Text(x), selected: labSide == x, onSelected: (_) => setState(() { labSide = x; labShown = 50; }))]),
       Wrap(spacing: 8, children: [for (final x in const ['All', 'Plain', 'With trend']) ChoiceChip(label: Text(x), selected: labVersion == x, onSelected: (_) => setState(() => labVersion = x))]),
-      const Padding(padding: EdgeInsets.fromLTRB(4, 10, 4, 2), child: Text('Indicators (tap one to see all its trades)', style: TextStyle(fontWeight: FontWeight.w600))),
+      const Padding(padding: EdgeInsets.fromLTRB(4, 10, 4, 2), child: Text('Indicators (tap one to see all its trades, tap a trade to see it on the chart)', style: TextStyle(fontWeight: FontWeight.w600))),
       for (final n in order)
         Card(
           color: labSel == n ? Theme.of(context).colorScheme.primaryContainer : null,
@@ -5483,8 +5616,8 @@ class _HomeState extends State<Home> {
               const SizedBox(height: 6),
               if (list.isEmpty) const Text('No trades yet for this filter.', style: TextStyle(fontSize: 12)),
               for (final x in list.take(labShown))
-                Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 3),
+                InkWell(
+                  onTap: () => openLevels(x.s.coin, x.s.tf, x.s.t0, x.s.price, x.sl, x.tp, context),
                   child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
                     Expanded(
                       child: Text('${when(x.s.t0)}  ${x.side == 1 ? 'BUY' : 'SELL'} ${x.s.coin} ${x.s.tf}\n'
@@ -5535,7 +5668,7 @@ class _HomeState extends State<Home> {
   @override
   Widget build(BuildContext context) {
     return DefaultTabController(
-      length: 10,
+      length: 7,
       child: Scaffold(
         appBar: AppBar(
           title: const Text('Signal Bot'),
@@ -5550,11 +5683,8 @@ class _HomeState extends State<Home> {
           ],
           bottom: const TabBar(isScrollable: true, tabs: [
             Tab(text: 'Markets'),
-            Tab(text: 'Scanner'),
             Tab(text: 'Signals'),
-            Tab(text: 'News'),
             Tab(text: 'Alerts'),
-            Tab(text: 'Account'),
             Tab(text: 'Paper'),
             Tab(text: 'Lab'),
             Tab(text: 'Report'),
@@ -5569,7 +5699,7 @@ class _HomeState extends State<Home> {
                 child: Text('Updated ${ago(data!['updated'])}', style: const TextStyle(fontSize: 12)),
               ),
             Expanded(
-              child: TabBarView(children: [marketTab(), scannerTab(), signalsTab(), newsTab(), alertsTab(), accountTab(), paperTab(), labTab(), reportTab(), expTab()]),
+              child: TabBarView(children: [marketTab(), signalsTab(), alertsTab(), paperTab(), labTab(), reportTab(), expTab()]),
             ),
             const Padding(
               padding: EdgeInsets.all(6),
